@@ -51,6 +51,35 @@ You can also download the binary from the
 `--root` stores the VM state, including the guest-owned CAS and ActionCache.
 Reusing the same root keeps the local cache warm across worker restarts.
 
+### VM Options
+
+`serve-vm` accepts these flags, as `--flag=value` or `--flag value`:
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--listen` | `127.0.0.1:8980` | Address for the public gRPC listener. |
+| `--root` | `/tmp/actiond-vm` (`actiond-vm` on Windows) | Directory for VM state and the default CAS image. |
+| `--memory-mib` | `512` | Guest memory. Raise it for compilers and JVM tools; 512 MiB is too small for many C++ and JVM builds and gets actions OOM-killed. |
+| `--cpus` | `2` | Guest vCPUs, which bounds how many actions run in parallel. |
+| `--cas-image` | under `--root` | Path of the guest-owned ext4 CAS image. |
+| `--cas-image-size-mib` | `32768` | Size of a newly created CAS image. |
+| `--kernel` | embedded | Override the guest kernel image. |
+| `--initramfs` | embedded | Override the guest initramfs, for example one built from a local `//vm:initramfs_aarch64`. |
+| `--runtime-image` | embedded | Override the runtime SquashFS, for example one built from a local `//runtimes:runtimes_squashfs_aarch64`. |
+| `--start-timeout-ms` | `30000` | How long to wait for the VM to start. |
+| `--connect-timeout-ms` | `60000` | How long to wait for the guest gRPC server. |
+| `--actiondfs-stats-path` | unset | Periodically write actiondfs counters to this file (requires a build with `--config=executor_timing_logs`). |
+
+For example, on a 16-core machine with 64 GB of memory:
+
+```bash
+./darwin-actiond_macos_arm64 serve-vm \
+  --listen=127.0.0.1:8980 \
+  --root="$HOME/Library/Caches/actiond/vm" \
+  --memory-mib=24576 \
+  --cpus=12
+```
+
 The Windows ARM64 and x86_64 release binaries use Host Compute System and
 Hyper-V sockets. The Windows smoke runs the embedded guest artifacts:
 
