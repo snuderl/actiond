@@ -656,6 +656,13 @@ fn forkAction(action: ForkAction) !std.os.linux.pid_t {
         linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
         @intFromPtr(shared_memory_mount_data.ptr),
     ), "mount_shm");
+    childSyscallName(linux.mount(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
+        0,
+    ), "mount_sys");
     childDropPrivileges(action.sandbox_uid, action.sandbox_gid);
     childSyscallName(linux.chdir(action.cwd.ptr), "chdir");
     childInstallSocketFilter();
