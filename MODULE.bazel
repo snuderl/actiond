@@ -276,6 +276,8 @@ glibc_deb_runtime(
         "59e4af5c1fac70d1fbc19f3c732331ace8449f1f7112887e7b56b8370bd8942b",
         "313e94b051c3e3974dea06c4576dc2b42f04cf7aba6c9dbb2f14135c218c7be7",
         "0102eb80384c2432c4be819663341a1c4e511d05f13ec1467643696531ec6491",
+        "54291f2dd185d3a759227b31b7de4269e495a084fdad89e24a9cc4d0d20888a7",
+        "7e569c3b4ec24a0c1d0a2d6d22493b98a725f72771f3444cfdd8e2f6fa9b7a5b",
     ],
     urls = [
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/g/glibc/libc6_2.35-0ubuntu3.13_arm64.deb",
@@ -313,6 +315,8 @@ glibc_deb_runtime(
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/libu/libunistring/libunistring2_1.0-1_arm64.deb",
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/libx/libxml2/libxml2_2.9.13+dfsg-1ubuntu0.11_arm64.deb",
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/libz/libzstd/libzstd1_1.4.8+dfsg-3build1_arm64.deb",
+        "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/r/readline/libreadline8_8.1.2-1_arm64.deb",
+        "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/n/ncurses/libtinfo6_6.3-2ubuntu0.1_arm64.deb",
     ],
 )
 
@@ -358,6 +362,8 @@ glibc_deb_runtime(
         "988fb59de6a0a313844277e8a6e45d3dc16f5ea75a603a46b16b936426f0ac65",
         "74eb1df2112ec3cd5a961b737d68c9a96c6de2f115a124ede81af5292b5d23e7",
         "ae7db00ce8b093e50c994518b90203544e063b4bc574836a048bb142b950b2c9",
+        "51fd16f608efa710c987e4b071ffba0bec63a9ac8e55eddd5770f5e5252edc09",
+        "1ec03fe34a7dfd8640a0564a3cad385a10b4f68ebf2190a4c08ccadb395133d3",
     ],
     urls = [
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/g/glibc/libc6_2.35-0ubuntu3.13_amd64.deb",
@@ -395,6 +401,8 @@ glibc_deb_runtime(
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/libu/libunistring/libunistring2_1.0-1_amd64.deb",
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/libx/libxml2/libxml2_2.9.13+dfsg-1ubuntu0.11_amd64.deb",
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/libz/libzstd/libzstd1_1.4.8+dfsg-3build1_amd64.deb",
+        "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/r/readline/libreadline8_8.1.2-1_amd64.deb",
+        "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/n/ncurses/libtinfo6_6.3-2ubuntu0.1_amd64.deb",
     ],
 )
 
