@@ -191,6 +191,9 @@ shell_deb_runtime(
     arch = "aarch64",
     busybox_sha256 = "c467c2014f91795a69237339693a64089347f73a96d10613e7285b7433b3965a",
     busybox_url = "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/b/busybox/busybox-static_1.30.1-7ubuntu3.1_arm64.deb",
+    coreutils_sha256 = "6572292ee74bb6a7efa88f05d0d0a7a5c696bae0ae341a438b983ae7775c9d47",
+    coreutils_strip_prefix = "coreutils-0.1.0-aarch64-unknown-linux-musl",
+    coreutils_url = "https://github.com/uutils/coreutils/releases/download/0.1.0/coreutils-0.1.0-aarch64-unknown-linux-musl.tar.gz",
     shell = "bash",
     urls = [
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/universe/b/bash/bash-static_5.1-6ubuntu1_arm64.deb",
@@ -205,6 +208,9 @@ shell_deb_runtime(
     arch = "x86_64",
     busybox_sha256 = "833b81ad44c4e201059e1bbb1dab285d5d0488736db169adfaa677fd953baae6",
     busybox_url = "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/main/b/busybox/busybox-static_1.30.1-7ubuntu3.1_amd64.deb",
+    coreutils_sha256 = "463648347b1fc337414a864bda960c9cbd1bd4a540f344c010ff5bb35199e6d7",
+    coreutils_strip_prefix = "coreutils-0.1.0-x86_64-unknown-linux-musl",
+    coreutils_url = "https://github.com/uutils/coreutils/releases/download/0.1.0/coreutils-0.1.0-x86_64-unknown-linux-musl.tar.gz",
     shell = "bash",
     urls = [
         "https://snapshot.ubuntu.com/ubuntu/20260614T000000Z/pool/universe/b/bash/bash-static_5.1-6ubuntu1_amd64.deb",

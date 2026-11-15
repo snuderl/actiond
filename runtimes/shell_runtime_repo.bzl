@@ -67,6 +67,58 @@ _BUSYBOX_APPLETS = [
     "zcat",
 ]
 
+# Applets that a static GNU-compatible coreutils (uutils) provides. When the runtime includes it,
+# these link to it instead of busybox: busybox's versions reject GNU forms that Bazel's own
+# launchers use, such as `mktemp -t XXXXXXXX.jar_manifest` (a suffix after the Xs) in the Java
+# launcher's long-classpath path.
+_COREUTILS_APPLETS = [
+    "basename",
+    "cat",
+    "chmod",
+    "cp",
+    "cut",
+    "date",
+    "dirname",
+    "du",
+    "echo",
+    "env",
+    "expr",
+    "false",
+    "head",
+    "id",
+    "install",
+    "ln",
+    "ls",
+    "md5sum",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "od",
+    "printf",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rm",
+    "rmdir",
+    "seq",
+    "sha1sum",
+    "sha256sum",
+    "sleep",
+    "sort",
+    "stat",
+    "tail",
+    "tee",
+    "test",
+    "touch",
+    "tr",
+    "true",
+    "uname",
+    "uniq",
+    "wc",
+    "whoami",
+    "yes",
+]
+
 # Without busybox, /usr/bin/env is a stub that only resolves `env bash` and `env sh`.
 _ENV_STUB = """#!/bin/bash
 case "$1" in
@@ -100,6 +152,10 @@ def _shell_deb_runtime_impl(rctx):
         fail("shell_deb_runtime expects exactly one static shell package")
     if bool(rctx.attr.busybox_url) != bool(rctx.attr.busybox_sha256):
         fail("busybox_url and busybox_sha256 must be set together")
+    if bool(rctx.attr.coreutils_url) != bool(rctx.attr.coreutils_sha256):
+        fail("coreutils_url and coreutils_sha256 must be set together")
+    if rctx.attr.coreutils_url and not rctx.attr.busybox_url:
+        fail("coreutils_url requires busybox_url, which provides the remaining applets")
 
     _extract_deb(rctx, rctx.attr.urls[0], rctx.attr.sha256s[0], "deb")
 
@@ -128,9 +184,28 @@ def _shell_deb_runtime_impl(rctx):
         if not rctx.path("root/bin/busybox").exists:
             fail("expected static busybox payload at root/bin/busybox")
         entries.append("f\tbin/busybox\t")
-        entries.extend(["s\tusr/bin/%s\t/bin/busybox" % applet for applet in _BUSYBOX_APPLETS])
         tree_srcs.append("root/bin/busybox")
         debs.append(rctx.attr.busybox_url)
+        coreutils_applets = []
+        if rctx.attr.coreutils_url:
+            rctx.download_and_extract(
+                url = rctx.attr.coreutils_url,
+                sha256 = rctx.attr.coreutils_sha256,
+                stripPrefix = rctx.attr.coreutils_strip_prefix,
+                output = "root/bin",
+            )
+            if not rctx.path("root/bin/coreutils").exists:
+                fail("expected a static coreutils binary at the archive root")
+            entries.append("f\tbin/coreutils\t")
+            tree_srcs.append("root/bin/coreutils")
+            debs.append(rctx.attr.coreutils_url)
+            coreutils_applets = _COREUTILS_APPLETS
+            entries.extend(["s\tusr/bin/%s\t/bin/coreutils" % applet for applet in coreutils_applets])
+        entries.extend([
+            "s\tusr/bin/%s\t/bin/busybox" % applet
+            for applet in _BUSYBOX_APPLETS
+            if applet not in coreutils_applets
+        ])
     else:
         rctx.file("root/usr/bin/env", _ENV_STUB, executable = True)
         entries.append("f\tusr/bin/env\t")
@@ -173,6 +248,9 @@ shell_deb_runtime = repository_rule(
         "arch": attr.string(mandatory = True),
         "busybox_sha256": attr.string(),
         "busybox_url": attr.string(doc = "Optional busybox-static .deb whose applets are linked into /usr/bin."),
+        "coreutils_sha256": attr.string(),
+        "coreutils_strip_prefix": attr.string(),
+        "coreutils_url": attr.string(doc = "Optional static GNU-compatible coreutils archive (e.g. uutils musl); its applets replace busybox's."),
         "shell": attr.string(mandatory = True),
         "sha256s": attr.string_list(mandatory = True),
         "urls": attr.string_list(mandatory = True),
