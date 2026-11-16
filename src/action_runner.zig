@@ -1918,6 +1918,39 @@ test "action clone flags isolate mounts, networking, process IDs, and IPC" {
     try std.testing.expectEqual(@as(u32, @intFromEnum(linux.SIG.CHLD)), flags & linux.CSIGNAL);
 }
 
+test "persistent workers use a slave mount namespace and cold actions a private one" {
+    const linux = std.os.linux;
+    try std.testing.expectEqual(linux.MS.PRIVATE | linux.MS.REC, MountPropagation.private.flags());
+    try std.testing.expectEqual(linux.MS.SLAVE | linux.MS.REC, MountPropagation.slave.flags());
+    try std.testing.expect(MountPropagation.private.flags() != MountPropagation.slave.flags());
+}
+
+test "spawnPersistentWorker and worker requests are Linux-only" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.UnsupportedHost, spawnPersistentWorker(
+        std.testing.io,
+        std.testing.allocator,
+        &.{ "/bin/worker", "--persistent_worker" },
+        &.{},
+        .{ .chroot_dir = "/nonexistent", .stderr_fd = -1 },
+    ));
+    var process = WorkerProcess{ .pid = 0, .stdin_fd = -1, .stdout_fd = -1, .cgroup = .{} };
+    var decoder = persistent_worker.ResponseDecoder.init(.proto);
+    defer decoder.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnsupportedHost, process.request(std.testing.io, std.testing.allocator, "", &decoder, null, null));
+}
+
+test "spawnPersistentWorker rejects an empty argv before touching the system" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.MissingArgv, spawnPersistentWorker(
+        std.testing.io,
+        std.testing.allocator,
+        &.{},
+        &.{},
+        .{ .chroot_dir = "/nonexistent", .stderr_fd = -1 },
+    ));
+}
+
 test "runCommandWithOptions rejects chroot execution on non-Linux hosts" {
     if (builtin.os.tag == .linux) return error.SkipZigTest;
 
