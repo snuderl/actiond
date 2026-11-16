@@ -808,7 +808,9 @@ fn executeWithWorker(
     const cas_blob_root_path = options.cas_blob_root_path orelse return error.MissingCasBlobRoot;
     const timeout_ns: ?u64 = if (action.timeout) |timeout| try timeout.toNanoseconds() else null;
 
+    const phase_start = std.Io.Clock.awake.now(io);
     const acquired = try pool.acquire(io, allocator, plan.pool_key, options.cancellation);
+    const acquire_done = std.Io.Clock.awake.now(io);
     const worker = acquired.worker;
     var healthy = false;
     defer pool.release(io, allocator, worker, healthy);
@@ -874,6 +876,8 @@ fn executeWithWorker(
 
     const execution_start_wall = timestampNow(io);
     const execution_start = std.Io.Clock.awake.now(io);
+    const setup_elapsed_ms = @divTrunc(acquire_done.durationTo(execution_start).nanoseconds, std.time.ns_per_ms);
+    const wait_elapsed_ms = @divTrunc(phase_start.durationTo(acquire_done).nanoseconds, std.time.ns_per_ms);
     const response = state.process.?.request(io, allocator, request_bytes, &decoder, timeout_ns, options.cancellation) catch |err| {
         var tail_buffer: [worker_stderr_log_bytes]u8 = undefined;
         var action_hash: [64]u8 = undefined;
@@ -932,14 +936,19 @@ fn executeWithWorker(
         .output_upload_start_timestamp = output_upload_start_wall,
         .output_upload_completed_timestamp = output_upload_completed_wall,
     };
+    const collect_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms) - execution_elapsed_ms;
     var action_hash: [64]u8 = undefined;
-    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d}", .{
+    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d} wait_ms={d} setup_ms={d} collect_ms={d} fresh={}", .{
         plan.key,
         state.id,
         state.requests,
         action_digest.formatHex(&action_hash),
         response.exit_code,
         execution_elapsed_ms,
+        wait_elapsed_ms,
+        setup_elapsed_ms,
+        collect_elapsed_ms,
+        acquired.fresh,
     });
     try checkExecutionCancellation(options.cancellation);
     return outcome;
