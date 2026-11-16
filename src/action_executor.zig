@@ -470,6 +470,52 @@ pub fn executeDecodedActionWithOptions(
 const default_run_options: action_runner.RunOptions = .{ .chroot_dir = "" };
 const persistent_worker_name = "actiond-worker";
 const worker_stderr_log_bytes = 4096;
+const worker_tree_name = "tree";
+const worker_tree_link_prefix = "/" ++ worker_tree_name ++ "/";
+
+/// Rewrites `<chroot>/workspace` so it holds exactly one symlink per top-level
+/// entry of `input_root_digest`, each pointing at `/tree/<name>` inside the
+/// chroot. The worker keeps `/workspace` as its cwd across requests; the
+/// symlinks make relative paths resolve through whatever is mounted at `/tree`
+/// now instead of the mount instance the cwd was opened on.
+fn syncWorkspaceLinks(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: cas.Store,
+    chroot_root: std.Io.Dir,
+    input_root_digest: cas.Digest,
+    cancellation: ?*const std.atomic.Value(bool),
+) !void {
+    const bytes = store.readAlloc(io, allocator, input_root_digest) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingInputDirectoryBlob,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    var reader = protobuf.Reader.init(bytes);
+    var root = try reapi.Directory.decodeOwned(allocator, &reader);
+    defer root.deinit(allocator);
+    try checkExecutionCancellation(cancellation);
+
+    var workspace = try chroot_root.openDir(io, "workspace", .{ .iterate = true });
+    defer workspace.close(io);
+    var stale: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stale.items) |name| allocator.free(name);
+        stale.deinit(allocator);
+    }
+    var it = workspace.iterate();
+    while (try it.next(io)) |entry| try stale.append(allocator, try allocator.dupe(u8, entry.name));
+    for (stale.items) |name| try workspace.deleteFile(io, name);
+
+    var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    inline for (.{ root.directories, root.files, root.symlinks }) |nodes| {
+        for (nodes) |node| {
+            try validateEntryName(node.name);
+            const target = try std.fmt.bufPrint(&target_buffer, "{s}{s}", .{ worker_tree_link_prefix, node.name });
+            try workspace.symLink(io, target, node.name, .{});
+        }
+    }
+}
 
 fn freeBindMounts(
     allocator: std.mem.Allocator,
@@ -579,7 +625,13 @@ pub const WorkerState = struct {
     root_path: []u8,
     root_path_z: [:0]u8,
     root_dir: std.Io.Dir,
+    /// The worker's cwd: a plain directory of symlinks `<name> -> /tree/<name>`,
+    /// one per top-level entry of the current input root. A process cwd pins
+    /// one mount instance, so the per-request tree cannot be mounted at the cwd
+    /// itself; the symlinks re-resolve through the mount table on every lookup.
     workspace_path: [:0]u8,
+    /// Mount point of the current request's actiondfs tree.
+    tree_path: [:0]u8,
     stderr_path: []u8,
     stderr_fd: std.posix.fd_t,
     bind_mounts: std.ArrayListUnmanaged(action_runner.BindMount) = .empty,
@@ -608,7 +660,7 @@ pub const WorkerState = struct {
     fn deinit(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator) void {
         if (self.process) |*process| process.terminate(io, allocator);
         if (comptime builtin.os.tag == .linux) {
-            unmountCollectionTarget(self.workspace_path);
+            unmountCollectionTarget(self.tree_path);
             if (self.root_shared) unmountCollectionTarget(self.root_path_z);
             _ = std.os.linux.close(self.stderr_fd);
         }
@@ -618,6 +670,7 @@ pub const WorkerState = struct {
         };
         std.Io.Dir.cwd().deleteFile(io, self.stderr_path) catch {};
         freeBindMounts(allocator, &self.bind_mounts, self.borrowed_source_count);
+        allocator.free(self.tree_path);
         allocator.free(self.workspace_path);
         allocator.free(self.stderr_path);
         allocator.free(self.root_path_z);
@@ -658,6 +711,8 @@ fn createWorkerState(
     errdefer allocator.free(root_path_z);
     const workspace_path = try std.fmt.allocPrintSentinel(allocator, "{s}/workspace", .{root_path}, 0);
     errdefer allocator.free(workspace_path);
+    const tree_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ root_path, worker_tree_name }, 0);
+    errdefer allocator.free(tree_path);
     const stderr_path = try std.fmt.allocPrint(allocator, "{s}.stderr", .{root_path});
     errdefer allocator.free(stderr_path);
 
@@ -667,6 +722,7 @@ fn createWorkerState(
     errdefer root_dir.close(io);
     try prepareChrootBaseDirs(io, root_dir);
     try root_dir.createDirPath(io, "workspace");
+    try root_dir.createDirPath(io, worker_tree_name);
 
     const state = try allocator.create(WorkerState);
     errdefer allocator.destroy(state);
@@ -677,6 +733,7 @@ fn createWorkerState(
         .root_path_z = root_path_z,
         .root_dir = root_dir,
         .workspace_path = workspace_path,
+        .tree_path = tree_path,
         .stderr_path = stderr_path,
         .stderr_fd = -1,
     };
@@ -768,7 +825,7 @@ fn executeWithWorker(
         cas_blob_root_path,
         options.actiondfs_stage_root_path,
         state.root_path,
-        state.workspace_path,
+        state.tree_path,
         input_root_digest,
         .actiondfs_strict,
     );
@@ -783,6 +840,7 @@ fn executeWithWorker(
     try action_runner.prepareChrootWritableDirs(io, workspace.stagePath(), default_run_options.sandbox_uid, default_run_options.sandbox_gid);
     try checkExecutionCancellation(options.cancellation);
     try workspace.mountWorkspace();
+    try syncWorkspaceLinks(io, allocator, store, state.root_dir, input_root_digest, options.cancellation);
 
     const input_fetch_completed_wall = timestampNow(io);
     if (state.process == null) {
@@ -803,7 +861,7 @@ fn executeWithWorker(
     }
     state.truncateStderr();
 
-    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = state.workspace_path };
+    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = state.tree_path };
     const arguments = try persistent_worker.expandRequestArguments(allocator, plan.flagfile_args, flagfiles.reader());
     defer {
         persistent_worker.freeArguments(allocator, arguments);
@@ -4405,4 +4463,74 @@ test "prepareChrootBaseDirs creates temporary directories" {
     try std.testing.expectEqualStrings("/proc/self/fd", descriptor_target[0..descriptor_target_len]);
     try work_dir.access(std.testing.io, "tmp", .{});
     try work_dir.access(std.testing.io, "var/tmp", .{});
+}
+
+test "syncWorkspaceLinks mirrors the input root's top-level entries as /tree symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cas_dir = try tmp.dir.createDirPathOpen(std.testing.io, "cas", .{});
+    defer cas_dir.close(std.testing.io);
+    const store = cas.Store.init(cas_dir);
+    try tmp.dir.createDirPath(std.testing.io, "w1/workspace");
+    var chroot = try tmp.dir.openDir(std.testing.io, "w1", .{ .iterate = true });
+    defer chroot.close(std.testing.io);
+
+    const child_digest = cas.Digest.fromBytes("child");
+    var child_hash: [64]u8 = undefined;
+    const first_bytes = try reapi.encodeAlloc(std.testing.allocator, reapi.Directory{
+        .files = &.{.{ .name = "MODULE.bazel", .digest = child_digest.toReapi(&child_hash) }},
+        .directories = &.{
+            .{ .name = "bazel-out", .digest = child_digest.toReapi(&child_hash) },
+            .{ .name = "external", .digest = child_digest.toReapi(&child_hash) },
+        },
+        .symlinks = &.{.{ .name = "link", .target = "external" }},
+    });
+    defer std.testing.allocator.free(first_bytes);
+    const first_digest = try store.putBytes(std.testing.io, first_bytes);
+    try syncWorkspaceLinks(std.testing.io, std.testing.allocator, store, chroot, first_digest, null);
+
+    var buffer: [256]u8 = undefined;
+    for ([_][]const u8{ "MODULE.bazel", "bazel-out", "external", "link" }) |name| {
+        const len = try chroot.readLink(std.testing.io, try std.fmt.bufPrint(&buffer, "workspace/{s}", .{name}), &buffer);
+        var expected: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "/tree/{s}", .{name}), buffer[0..len]);
+    }
+
+    // A later request with a different root replaces the whole set.
+    const second_bytes = try reapi.encodeAlloc(std.testing.allocator, reapi.Directory{
+        .directories = &.{.{ .name = "src", .digest = child_digest.toReapi(&child_hash) }},
+    });
+    defer std.testing.allocator.free(second_bytes);
+    const second_digest = try store.putBytes(std.testing.io, second_bytes);
+    try syncWorkspaceLinks(std.testing.io, std.testing.allocator, store, chroot, second_digest, null);
+    var workspace = try chroot.openDir(std.testing.io, "workspace", .{ .iterate = true });
+    defer workspace.close(std.testing.io);
+    var count: usize = 0;
+    var it = workspace.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        count += 1;
+        try std.testing.expectEqualStrings("src", entry.name);
+        try std.testing.expectEqual(std.Io.File.Kind.sym_link, entry.kind);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    // Missing root blobs and cancellation stop before touching the workspace.
+    try std.testing.expectError(error.MissingInputDirectoryBlob, syncWorkspaceLinks(
+        std.testing.io,
+        std.testing.allocator,
+        store,
+        chroot,
+        cas.Digest.fromBytes("absent"),
+        null,
+    ));
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.ExecutionCancelled, syncWorkspaceLinks(
+        std.testing.io,
+        std.testing.allocator,
+        store,
+        chroot,
+        second_digest,
+        &cancelled,
+    ));
+    _ = try chroot.statFile(std.testing.io, "workspace/src", .{ .follow_symlinks = false });
 }
