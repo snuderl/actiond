@@ -19,7 +19,9 @@ pub const max_flagfile_bytes = 16 * 1024 * 1024;
 pub const max_flagfile_depth = 8;
 pub const max_response_bytes = 16 * 1024 * 1024;
 pub const default_idle_ttl_ns: i96 = 10 * std.time.ns_per_min;
+pub const default_sticky_ns: i96 = 5 * std.time.ns_per_s;
 pub const default_memory_per_worker_mib: u64 = 2048;
+pub const burst_memory_per_worker_mib: u64 = 1365;
 
 pub const Protocol = enum {
     proto,
@@ -348,20 +350,30 @@ pub const ResponseDecoder = struct {
 };
 
 pub const Config = struct {
-    /// Total warm workers across all keys; 0 disables the feature.
+    /// Warm workers across all keys before eviction starts; 0 disables the feature.
     max_workers: u32,
+    /// Absolute cap: when the budget is full but every idle worker was used
+    /// within `sticky_ns`, the pool grows up to this instead of evicting a
+    /// worker that is about to be needed again. Never below `max_workers`.
+    hard_max_workers: u32 = 0,
     idle_ttl_ns: i96 = default_idle_ttl_ns,
+    sticky_ns: i96 = default_sticky_ns,
 
-    /// `clamp(memory_mib / 2048, 1, cpu_count)`: about one warm JVM per 2 GiB,
-    /// never more workers than vCPUs.
+    /// `max_workers = clamp(memory_mib / 2048, 1, cpu_count)` (one warm JVM per
+    /// 2 GiB), `hard_max_workers = clamp(memory_mib / 1365, max, cpu_count)`:
+    /// bursts may pack workers to about 1.3 GiB each, never beyond one per vCPU.
     pub fn fromResources(memory_mib: u64, cpu_count: u64) Config {
-        const by_memory = memory_mib / default_memory_per_worker_mib;
         const cpus = @max(cpu_count, 1);
-        const workers = @min(@max(by_memory, 1), cpus);
-        return .{ .max_workers = @intCast(@min(workers, std.math.maxInt(u32))) };
+        const soft = @min(@max(memory_mib / default_memory_per_worker_mib, 1), cpus);
+        const hard = @min(@max(memory_mib / burst_memory_per_worker_mib, soft), cpus);
+        return .{
+            .max_workers = @intCast(@min(soft, std.math.maxInt(u32))),
+            .hard_max_workers = @intCast(@min(hard, std.math.maxInt(u32))),
+        };
     }
 
-    /// Parses `actiond.persistent_workers=<N>` from the kernel command line.
+    /// Parses `actiond.persistent_workers=<N>` from the kernel command line;
+    /// an explicit N is both the budget and the cap.
     pub fn fromCmdline(cmdline: []const u8, fallback: Config) Config {
         var tokens = std.mem.tokenizeAny(u8, cmdline, " \n\t");
         while (tokens.next()) |token| {
@@ -370,9 +382,14 @@ pub const Config = struct {
             const workers = std.fmt.parseInt(u32, value, 10) catch return fallback;
             var config = fallback;
             config.max_workers = workers;
+            config.hard_max_workers = workers;
             return config;
         }
         return fallback;
+    }
+
+    fn hardMax(self: Config) u32 {
+        return @max(self.hard_max_workers, self.max_workers);
     }
 };
 
@@ -384,6 +401,7 @@ pub const Stats = struct {
     requests: u64 = 0,
     fallbacks: u64 = 0,
     waits: u64 = 0,
+    over_budget: u64 = 0,
 };
 
 /// Process-agnostic bookkeeping for warm workers. The executor attaches the
@@ -491,9 +509,14 @@ pub const Pool = struct {
         }
 
         if (self.workers.items.len >= self.config.max_workers) {
-            const victim = self.leastRecentlyUsedIdleLocked() orelse return null;
-            self.stats.evicted_lru += 1;
-            self.removeLocked(allocator, victim);
+            if (self.leastRecentlyUsedIdleLocked(now)) |victim| {
+                self.stats.evicted_lru += 1;
+                self.removeLocked(allocator, victim);
+            } else if (self.workers.items.len >= self.config.hardMax()) {
+                return null;
+            } else {
+                self.stats.over_budget += 1;
+            }
         }
 
         const worker = try allocator.create(Worker);
@@ -574,6 +597,7 @@ pub const Pool = struct {
             \\persistent_workers_requests {d}
             \\persistent_workers_fallbacks {d}
             \\persistent_workers_waits {d}
+            \\persistent_workers_over_budget {d}
             \\persistent_workers_evicted_idle {d}
             \\persistent_workers_evicted_lru {d}
             \\persistent_workers_destroyed_failed {d}
@@ -586,6 +610,7 @@ pub const Pool = struct {
             summary.stats.requests,
             summary.stats.fallbacks,
             summary.stats.waits,
+            summary.stats.over_budget,
             summary.stats.evicted_idle,
             summary.stats.evicted_lru,
             summary.stats.destroyed_failed,
@@ -594,13 +619,15 @@ pub const Pool = struct {
         try out.appendSlice(allocator, text);
     }
 
-    /// LRU idle worker, preferring keys that keep at least one other worker so
-    /// a burst of one mnemonic does not evict the only warm worker of another.
-    fn leastRecentlyUsedIdleLocked(self: *Pool) ?*Worker {
+    /// LRU idle worker that has not been used within `sticky_ns`, preferring
+    /// keys that keep at least one other worker so a burst of one mnemonic does
+    /// not evict the only warm worker of another.
+    fn leastRecentlyUsedIdleLocked(self: *Pool, now: std.Io.Timestamp) ?*Worker {
         var victim: ?*Worker = null;
         var victim_shared = false;
         for (self.workers.items) |worker| {
             if (worker.busy) continue;
+            if (worker.last_used.durationTo(now).nanoseconds < self.config.sticky_ns) continue;
             const shared = self.keyWorkerCountLocked(worker.pool_key) > 1;
             const current = victim orelse {
                 victim = worker;
@@ -895,15 +922,57 @@ test "ResponseDecoder parses json responses and waits for complete objects" {
 
 test "Config derives the worker budget from memory and cpus and honors the cmdline" {
     try std.testing.expectEqual(@as(u32, 8), Config.fromResources(16384, 10).max_workers);
+    try std.testing.expectEqual(@as(u32, 10), Config.fromResources(16384, 10).hard_max_workers);
     try std.testing.expectEqual(@as(u32, 4), Config.fromResources(16384, 4).max_workers);
+    try std.testing.expectEqual(@as(u32, 4), Config.fromResources(16384, 4).hard_max_workers);
     try std.testing.expectEqual(@as(u32, 1), Config.fromResources(512, 2).max_workers);
+    try std.testing.expectEqual(@as(u32, 1), Config.fromResources(512, 2).hard_max_workers);
     try std.testing.expectEqual(@as(u32, 1), Config.fromResources(0, 0).max_workers);
+    try std.testing.expectEqual(@as(u32, 4), Config.fromResources(8192, 16).max_workers);
+    try std.testing.expectEqual(@as(u32, 6), Config.fromResources(8192, 16).hard_max_workers);
 
     const fallback = Config.fromResources(16384, 10);
-    try std.testing.expectEqual(@as(u32, 0), Config.fromCmdline("console=hvc0 actiond.persistent_workers=0 quiet", fallback).max_workers);
-    try std.testing.expectEqual(@as(u32, 3), Config.fromCmdline("actiond.persistent_workers=3\n", fallback).max_workers);
+    const disabled = Config.fromCmdline("console=hvc0 actiond.persistent_workers=0 quiet", fallback);
+    try std.testing.expectEqual(@as(u32, 0), disabled.max_workers);
+    try std.testing.expectEqual(@as(u32, 0), disabled.hard_max_workers);
+    const three = Config.fromCmdline("actiond.persistent_workers=3\n", fallback);
+    try std.testing.expectEqual(@as(u32, 3), three.max_workers);
+    try std.testing.expectEqual(@as(u32, 3), three.hard_max_workers);
     try std.testing.expectEqual(@as(u32, 8), Config.fromCmdline("actiond.persistent_workers=lots", fallback).max_workers);
     try std.testing.expectEqual(@as(u32, 8), Config.fromCmdline("console=hvc0", fallback).max_workers);
+    try std.testing.expectEqual(@as(u32, 5), (Config{ .max_workers = 5, .hard_max_workers = 2 }).hardMax());
+}
+
+test "Pool grows over budget instead of evicting recently used workers, up to the hard cap" {
+    var log: TestDestroyLog = .{};
+    defer log.destroyed.deinit(std.testing.allocator);
+    var pool = Pool.init(.{
+        .max_workers = 2,
+        .hard_max_workers = 3,
+        .sticky_ns = 5 * std.time.ns_per_s,
+    }, &log, TestDestroyLog.destroy);
+    defer pool.deinit(std.testing.allocator);
+
+    const a = (try pool.acquireLocked(std.testing.allocator, "a", testTimestamp(0))).?;
+    const b = (try pool.acquireLocked(std.testing.allocator, "b", testTimestamp(0))).?;
+    pool.releaseLocked(std.testing.allocator, a.worker, true, testTimestamp(10));
+    pool.releaseLocked(std.testing.allocator, b.worker, true, testTimestamp(10));
+
+    // Both idle workers were used 1 s ago: nothing is evicted, the pool grows to 3.
+    const c = (try pool.acquireLocked(std.testing.allocator, "c", testTimestamp(11))).?;
+    try std.testing.expect(c.fresh);
+    try std.testing.expectEqual(@as(usize, 3), pool.workers.items.len);
+    try std.testing.expectEqual(@as(u64, 0), log.destroyed.items.len);
+    try std.testing.expectEqual(@as(u64, 1), pool.stats.over_budget);
+
+    // At the hard cap with only sticky idle workers, callers wait.
+    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "d", testTimestamp(12))) == null);
+
+    // Once a worker ages past the sticky window it becomes the LRU victim.
+    const d = (try pool.acquireLocked(std.testing.allocator, "d", testTimestamp(16))).?;
+    try std.testing.expect(d.fresh);
+    try std.testing.expectEqualSlices(u64, &.{1}, log.destroyed.items);
+    try std.testing.expectEqual(@as(usize, 3), pool.workers.items.len);
 }
 
 const TestDestroyLog = struct {
@@ -948,7 +1017,7 @@ test "Pool reuses idle workers per key, spawns within budget and waits when busy
 test "Pool evicts the least recently used idle worker of another key when full" {
     var log: TestDestroyLog = .{};
     defer log.destroyed.deinit(std.testing.allocator);
-    var pool = Pool.init(.{ .max_workers = 2 }, &log, TestDestroyLog.destroy);
+    var pool = Pool.init(.{ .max_workers = 2, .sticky_ns = 0 }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
 
     const a = (try pool.acquireLocked(std.testing.allocator, "a", testTimestamp(0))).?;
@@ -971,7 +1040,7 @@ test "Pool evicts the least recently used idle worker of another key when full" 
 test "Pool eviction spares the only worker of a key while another key has spares" {
     var log: TestDestroyLog = .{};
     defer log.destroyed.deinit(std.testing.allocator);
-    var pool = Pool.init(.{ .max_workers = 3 }, &log, TestDestroyLog.destroy);
+    var pool = Pool.init(.{ .max_workers = 3, .sticky_ns = 0 }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
 
     // kotlin: worker 1 (idle, oldest). javac: workers 2 and 3 (idle, newer).
