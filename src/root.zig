@@ -22,6 +22,7 @@ pub const http2_frame = @import("http2_frame.zig");
 pub const http2_header = @import("http2_header.zig");
 pub const http2_hpack = @import("http2_hpack.zig");
 pub const linux_vm_host = @import("linux_vm_host.zig");
+pub const persistent_worker = @import("persistent_worker.zig");
 pub const protobuf_wire = @import("protobuf_wire.zig");
 pub const qemu_vm = @import("qemu_vm.zig");
 pub const reapi = @import("reapi.zig");
@@ -59,6 +60,7 @@ test {
     _ = http2_header;
     _ = http2_hpack;
     _ = linux_vm_host;
+    _ = persistent_worker;
     _ = protobuf_wire;
     _ = qemu_vm;
     _ = reapi;
