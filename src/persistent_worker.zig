@@ -594,17 +594,37 @@ pub const Pool = struct {
         try out.appendSlice(allocator, text);
     }
 
+    /// LRU idle worker, preferring keys that keep at least one other worker so
+    /// a burst of one mnemonic does not evict the only warm worker of another.
     fn leastRecentlyUsedIdleLocked(self: *Pool) ?*Worker {
         var victim: ?*Worker = null;
+        var victim_shared = false;
         for (self.workers.items) |worker| {
             if (worker.busy) continue;
+            const shared = self.keyWorkerCountLocked(worker.pool_key) > 1;
             const current = victim orelse {
                 victim = worker;
+                victim_shared = shared;
                 continue;
             };
+            if (shared != victim_shared) {
+                if (shared) {
+                    victim = worker;
+                    victim_shared = true;
+                }
+                continue;
+            }
             if (worker.last_used.toNanoseconds() < current.last_used.toNanoseconds()) victim = worker;
         }
         return victim;
+    }
+
+    fn keyWorkerCountLocked(self: *const Pool, pool_key: []const u8) usize {
+        var count: usize = 0;
+        for (self.workers.items) |worker| {
+            if (std.mem.eql(u8, worker.pool_key, pool_key)) count += 1;
+        }
+        return count;
     }
 
     fn reapIdleLocked(self: *Pool, allocator: std.mem.Allocator, now: std.Io.Timestamp) void {
@@ -946,6 +966,32 @@ test "Pool evicts the least recently used idle worker of another key when full" 
     // a is still idle and still serves key a without a spawn.
     const a_again = (try pool.acquireLocked(std.testing.allocator, "a", testTimestamp(7))).?;
     try std.testing.expect(!a_again.fresh);
+}
+
+test "Pool eviction spares the only worker of a key while another key has spares" {
+    var log: TestDestroyLog = .{};
+    defer log.destroyed.deinit(std.testing.allocator);
+    var pool = Pool.init(.{ .max_workers = 3 }, &log, TestDestroyLog.destroy);
+    defer pool.deinit(std.testing.allocator);
+
+    // kotlin: worker 1 (idle, oldest). javac: workers 2 and 3 (idle, newer).
+    const kotlin = (try pool.acquireLocked(std.testing.allocator, "kotlin", testTimestamp(0))).?;
+    const javac_a = (try pool.acquireLocked(std.testing.allocator, "javac", testTimestamp(0))).?;
+    const javac_b = (try pool.acquireLocked(std.testing.allocator, "javac", testTimestamp(0))).?;
+    pool.releaseLocked(std.testing.allocator, kotlin.worker, true, testTimestamp(1));
+    pool.releaseLocked(std.testing.allocator, javac_a.worker, true, testTimestamp(5));
+    pool.releaseLocked(std.testing.allocator, javac_b.worker, true, testTimestamp(6));
+
+    // A third key evicts the older javac spare, not the lone kotlin worker.
+    _ = (try pool.acquireLocked(std.testing.allocator, "turbine", testTimestamp(7))).?;
+    try std.testing.expectEqualSlices(u64, &.{2}, log.destroyed.items);
+    const kotlin_again = (try pool.acquireLocked(std.testing.allocator, "kotlin", testTimestamp(8))).?;
+    try std.testing.expect(!kotlin_again.fresh);
+    pool.releaseLocked(std.testing.allocator, kotlin_again.worker, true, testTimestamp(9));
+
+    // With every key down to one worker, plain LRU applies (javac b idle since 6).
+    _ = (try pool.acquireLocked(std.testing.allocator, "ktfmt", testTimestamp(10))).?;
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, log.destroyed.items);
 }
 
 test "Pool retires unhealthy workers and idle workers past their TTL" {
