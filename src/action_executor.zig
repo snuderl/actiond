@@ -652,6 +652,71 @@ fn collectOutcomeOutputs(
     );
 }
 
+/// `MemAvailable` from the guest's /proc/meminfo in MiB (0 when unreadable),
+/// logged per worker request so memory footprints can be compared from the
+/// console log.
+pub fn guestMemAvailableMib(io: std.Io) u64 {
+    var buffer: [8192]u8 = undefined;
+    const meminfo = std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &buffer) catch return 0;
+    var lines = std.mem.splitScalar(u8, meminfo, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
+        var fields = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
+        const value = fields.next() orelse return 0;
+        const kib = std.fmt.parseInt(u64, value, 10) catch return 0;
+        return kib / 1024;
+    }
+    return 0;
+}
+
+/// Resident set of a worker's whole process tree (the namespace init, the
+/// launcher, the JVM) in MiB, from /proc; 0 when unreadable. Logged per
+/// request so JVM footprints can be compared from the console log.
+pub fn workerTreeRssMib(io: std.Io, allocator: std.mem.Allocator, root_pid: std.os.linux.pid_t) u64 {
+    if (comptime builtin.os.tag != .linux) return 0;
+    const Entry = struct { ppid: i32, rss_kib: u64 };
+    var entries: std.AutoHashMapUnmanaged(i32, Entry) = .empty;
+    defer entries.deinit(allocator);
+    var proc = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch return 0;
+    defer proc.close(io);
+    var it = proc.iterate();
+    while (it.next(io) catch null) |entry| {
+        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        var path_buffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buffer, "{d}/status", .{pid}) catch continue;
+        var status_buffer: [4096]u8 = undefined;
+        const status = proc.readFile(io, path, &status_buffer) catch continue;
+        var ppid: i32 = 0;
+        var rss_kib: u64 = 0;
+        var lines = std.mem.splitScalar(u8, status, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "PPid:")) {
+                ppid = std.fmt.parseInt(i32, std.mem.trim(u8, line["PPid:".len..], " \t"), 10) catch 0;
+            } else if (std.mem.startsWith(u8, line, "VmRSS:")) {
+                var fields = std.mem.tokenizeAny(u8, line["VmRSS:".len..], " \t");
+                rss_kib = std.fmt.parseInt(u64, fields.next() orelse "0", 10) catch 0;
+            }
+        }
+        entries.put(allocator, pid, .{ .ppid = ppid, .rss_kib = rss_kib }) catch return 0;
+    }
+    var total_kib: u64 = 0;
+    var pids = entries.keyIterator();
+    while (pids.next()) |pid| {
+        var current = pid.*;
+        var hops: usize = 0;
+        while (hops < 64) : (hops += 1) {
+            if (current == root_pid) {
+                total_kib += entries.get(pid.*).?.rss_kib;
+                break;
+            }
+            const parent = (entries.get(current) orelse break).ppid;
+            if (parent <= 0) break;
+            current = parent;
+        }
+    }
+    return total_kib / 1024;
+}
+
 /// Worker events are the evidence that an action ran warm; they bypass
 /// `std.log` because release builds compile info logging out.
 fn logWorkerEvent(io: std.Io, comptime fmt: []const u8, args: anytype) void {
@@ -1104,7 +1169,7 @@ fn executeSharedExecrootRequest(
     };
     const collect_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms) - execution_elapsed_ms;
     var action_hash: [64]u8 = undefined;
-    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d} wait_ms={d} setup_ms={d} collect_ms={d} fresh={} multiplex=true", .{
+    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d} wait_ms={d} setup_ms={d} collect_ms={d} fresh={} multiplex=true mem_avail_mb={d} rss_mb={d}", .{
         plan.key,
         state.id,
         request_count,
@@ -1115,6 +1180,8 @@ fn executeSharedExecrootRequest(
         setup_elapsed_ms,
         collect_elapsed_ms,
         request_count == 1,
+        guestMemAvailableMib(io),
+        workerTreeRssMib(io, allocator, state.process.?.pid),
     });
     try checkExecutionCancellation(options.cancellation);
     return outcome;
@@ -1288,7 +1355,7 @@ fn executeWithWorker(
     };
     const collect_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms) - execution_elapsed_ms;
     var action_hash: [64]u8 = undefined;
-    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d} wait_ms={d} setup_ms={d} collect_ms={d} fresh={}", .{
+    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d} wait_ms={d} setup_ms={d} collect_ms={d} fresh={} mem_avail_mb={d} rss_mb={d}", .{
         plan.key,
         state.id,
         request_count,
@@ -1299,6 +1366,8 @@ fn executeWithWorker(
         setup_elapsed_ms,
         collect_elapsed_ms,
         acquired.fresh,
+        guestMemAvailableMib(io),
+        workerTreeRssMib(io, allocator, state.process.?.pid),
     });
     try checkExecutionCancellation(options.cancellation);
     return outcome;
