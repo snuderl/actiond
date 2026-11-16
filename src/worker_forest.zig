@@ -35,10 +35,16 @@ pub const Forest = struct {
     sandbox_uid: u32,
     sandbox_gid: u32,
     mutex: std.Io.Mutex = .init,
-    synced: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    /// Forest path -> digest of the Directory last synced there. Keyed by path,
+    /// not digest alone: the same Directory appears at several paths (the
+    /// compiler's lib/ is also inside the tool's runfiles), and each one needs
+    /// its own links.
+    synced: std.StringHashMapUnmanaged([32]u8) = .empty,
     stats: Stats = .{},
 
     pub fn deinit(self: *Forest, allocator: std.mem.Allocator) void {
+        var it = self.synced.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
         self.synced.deinit(allocator);
         self.* = undefined;
     }
@@ -68,9 +74,11 @@ pub const Forest = struct {
         depth: usize,
     ) !void {
         if (depth > max_depth) return error.InputTreeTooDeep;
-        if (self.synced.contains(digest.hash)) {
-            self.stats.directories_skipped += 1;
-            return;
+        if (self.synced.get(relative)) |synced_hash| {
+            if (std.mem.eql(u8, &synced_hash, &digest.hash)) {
+                self.stats.directories_skipped += 1;
+                return;
+            }
         }
         if (cancellation) |value| {
             if (value.load(.acquire)) return error.ExecutionCancelled;
@@ -109,7 +117,13 @@ pub const Forest = struct {
             const child_digest = try cas.Digest.fromReapi(child.digest orelse return error.MissingDirectoryDigest);
             try self.syncDirectory(io, allocator, store, child_digest, path, cancellation, depth + 1);
         }
-        try self.synced.put(allocator, digest.hash, {});
+        if (self.synced.getPtr(relative)) |synced_hash| {
+            synced_hash.* = digest.hash;
+        } else {
+            const key = try allocator.dupe(u8, relative);
+            errdefer allocator.free(key);
+            try self.synced.put(allocator, key, digest.hash);
+        }
         self.stats.directories_synced += 1;
     }
 
@@ -249,6 +263,37 @@ test "Forest.sync mirrors files as CAS symlinks, directories as real directories
     // Re-syncing an already synced root is a no-op.
     try forest.sync(std.testing.io, std.testing.allocator, store, root2, null);
     try std.testing.expectEqual(@as(u64, 2), forest.stats.directories_skipped);
+}
+
+test "Forest.sync links the same Directory digest at every path it appears" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cas_dir = try tmp.dir.createDirPathOpen(std.testing.io, "cas", .{});
+    defer cas_dir.close(std.testing.io);
+    const store = cas.Store.init(cas_dir);
+    try store.ensureLayout(std.testing.io);
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    var workspace = try tmp.dir.openDir(std.testing.io, "workspace", .{ .iterate = true });
+    defer workspace.close(std.testing.io);
+
+    const jar = try store.putBytes(std.testing.io, "compiler");
+    var jar_hash: [64]u8 = undefined;
+    const lib = try putDirectory(store, .{ .files = &.{.{ .name = "kotlin-compiler.jar", .digest = jar.toReapi(&jar_hash) }} });
+    var lib_hash: [64]u8 = undefined;
+    // The compiler's lib/ appears under external/ and again inside the tool's runfiles.
+    const root = try putDirectory(store, .{ .directories = &.{
+        .{ .name = "external", .digest = lib.toReapi(&lib_hash) },
+        .{ .name = "runfiles", .digest = lib.toReapi(&lib_hash) },
+    } });
+    var forest = Forest{ .dir = workspace, .blob_link_root = "/cas", .sandbox_uid = 65534, .sandbox_gid = 65534 };
+    defer forest.deinit(std.testing.allocator);
+    try forest.sync(std.testing.io, std.testing.allocator, store, root, null);
+
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    _ = try workspace.readLink(std.testing.io, "external/kotlin-compiler.jar", &link_buffer);
+    _ = try workspace.readLink(std.testing.io, "runfiles/kotlin-compiler.jar", &link_buffer);
+    try std.testing.expectEqual(@as(u64, 0), forest.stats.directories_skipped);
+    try std.testing.expectEqual(@as(u64, 2), forest.stats.links_written);
 }
 
 test "Forest.sync rejects missing blobs, bad names and cancellation" {
