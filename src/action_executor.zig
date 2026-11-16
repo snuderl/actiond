@@ -1033,29 +1033,6 @@ fn executeSharedExecrootRequest(
     }
     const request_bytes = try persistent_worker.encodeWorkRequest(allocator, plan.protocol, arguments, request_id, "");
     defer allocator.free(request_bytes);
-    {
-        // Diagnostic: how the first jar argument resolves through the forest
-        // from the guest namespace.
-        var checked: usize = 0;
-        for (plan.flagfile_args) |flagfile_arg| {
-            const arg = persistent_worker.flagfilePath(flagfile_arg) orelse continue;
-            if (checked >= 1) continue;
-            checked += 1;
-            var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const link: []const u8 = if (forest.dir.readLink(io, arg, &link_buffer)) |len| link_buffer[0..len] else |err| @errorName(err);
-            const followed: []const u8 = if (forest.dir.statFile(io, arg, .{})) |_| "ok" else |err| @errorName(err);
-            logWorkerEvent(io, "persistent worker forest probe worker={d} arg={s} link={s} host_stat={s} synced={d} skipped={d} links={d}", .{
-                state.id,
-                arg,
-                link,
-                followed,
-                forest.stats.directories_synced,
-                forest.stats.directories_skipped,
-                forest.stats.links_written,
-            });
-        }
-    }
-
     const execution_start_wall = timestampNow(io);
     const execution_start = std.Io.Clock.awake.now(io);
     const setup_elapsed_ms = @divTrunc(acquire_done.durationTo(execution_start).nanoseconds, std.time.ns_per_ms);
