@@ -18,7 +18,7 @@ pub const max_key_len = 128;
 pub const max_flagfile_bytes = 16 * 1024 * 1024;
 pub const max_flagfile_depth = 8;
 pub const max_response_bytes = 16 * 1024 * 1024;
-pub const default_idle_ttl_ns: i96 = 10 * std.time.ns_per_min;
+pub const default_idle_ttl_ns: i96 = 30 * std.time.ns_per_min;
 pub const default_sticky_ns: i96 = 5 * std.time.ns_per_s;
 pub const default_memory_per_worker_mib: u64 = 2048;
 pub const burst_memory_per_worker_mib: u64 = 1365;
@@ -360,12 +360,15 @@ pub const Config = struct {
     sticky_ns: i96 = default_sticky_ns,
 
     /// `max_workers = clamp(memory_mib / 2048, 1, cpu_count)` (one warm JVM per
-    /// 2 GiB), `hard_max_workers = clamp(memory_mib / 1365, max, cpu_count)`:
-    /// bursts may pack workers to about 1.3 GiB each, never beyond one per vCPU.
+    /// 2 GiB), `hard_max_workers = clamp(memory_mib / 1365, max, cpu_count * 1.5)`:
+    /// bursts may pack workers to about 1.3 GiB each and oversubscribe the vCPUs
+    /// by half, because Bazel keeps more actions in flight than the VM has
+    /// cores and a request waiting for a slot costs more than a JVM sharing
+    /// a core (measured: 259 s of summed pool wait at a cap of 10 on 10 vCPUs).
     pub fn fromResources(memory_mib: u64, cpu_count: u64) Config {
         const cpus = @max(cpu_count, 1);
         const soft = @min(@max(memory_mib / default_memory_per_worker_mib, 1), cpus);
-        const hard = @min(@max(memory_mib / burst_memory_per_worker_mib, soft), cpus);
+        const hard = @min(@max(memory_mib / burst_memory_per_worker_mib, soft), cpus + cpus / 2);
         return .{
             .max_workers = @intCast(@min(soft, std.math.maxInt(u32))),
             .hard_max_workers = @intCast(@min(hard, std.math.maxInt(u32))),
@@ -922,9 +925,11 @@ test "ResponseDecoder parses json responses and waits for complete objects" {
 
 test "Config derives the worker budget from memory and cpus and honors the cmdline" {
     try std.testing.expectEqual(@as(u32, 8), Config.fromResources(16384, 10).max_workers);
-    try std.testing.expectEqual(@as(u32, 10), Config.fromResources(16384, 10).hard_max_workers);
+    try std.testing.expectEqual(@as(u32, 12), Config.fromResources(16384, 10).hard_max_workers);
+    try std.testing.expectEqual(@as(u32, 10), Config.fromResources(32768, 10).max_workers);
+    try std.testing.expectEqual(@as(u32, 15), Config.fromResources(32768, 10).hard_max_workers);
     try std.testing.expectEqual(@as(u32, 4), Config.fromResources(16384, 4).max_workers);
-    try std.testing.expectEqual(@as(u32, 4), Config.fromResources(16384, 4).hard_max_workers);
+    try std.testing.expectEqual(@as(u32, 6), Config.fromResources(16384, 4).hard_max_workers);
     try std.testing.expectEqual(@as(u32, 1), Config.fromResources(512, 2).max_workers);
     try std.testing.expectEqual(@as(u32, 1), Config.fromResources(512, 2).hard_max_workers);
     try std.testing.expectEqual(@as(u32, 1), Config.fromResources(0, 0).max_workers);
