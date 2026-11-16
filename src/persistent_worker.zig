@@ -22,6 +22,8 @@ pub const multiplex_capacity_property = "actiond.worker_multiplex_capacity";
 pub const multiplex_sandboxing_tools = [_][]const u8{
     "rules_kotlin+/src/main/kotlin/build",
     "JavaBuilder",
+    // os2-core's //:detekt_wrapper; its rules_detekt patch resolves paths under sandbox_dir.
+    "/detekt_wrapper",
 };
 pub const cmdline_prefix = "actiond.persistent_workers=";
 pub const persistent_worker_flag = "--persistent_worker";
@@ -1348,10 +1350,13 @@ test "multiplexSupported follows the property, then the tool allowlist" {
     const kotlin: []const []const u8 = &.{ "bazel-out/exec/bin/external/rules_kotlin+/src/main/kotlin/build", "--persistent_worker" };
     const javac: []const []const u8 = &.{ "external/jdk/bin/java", "-jar", "external/java_tools/JavaBuilder_deploy.jar", "--persistent_worker" };
     const detekt: []const []const u8 = &.{ "bazel-out/exec/bin/external/rules_detekt+/detekt/wrapper/bin", "--persistent_worker" };
+    const os2_detekt: []const []const u8 = &.{ "bazel-out/exec/bin/detekt_wrapper", "--persistent_worker" };
     try std.testing.expect(multiplexSupported(kotlin, null));
     try std.testing.expect(multiplexSupported(javac, null));
     try std.testing.expect(!multiplexSupported(detekt, null));
     try std.testing.expect(multiplexSupported(detekt, "1"));
+    try std.testing.expect(multiplexSupported(os2_detekt, null));
+    try std.testing.expect(!multiplexSupported(os2_detekt, "0"));
     try std.testing.expect(!multiplexSupported(kotlin, "0"));
 
     var plan = (try Plan.fromCommand(std.testing.allocator, testCommand(&.{ kotlin[0], "--flagfile=a.params" }, null), .{ .properties = &.{
