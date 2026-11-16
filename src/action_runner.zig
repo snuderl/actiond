@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const build_options = @import("actiond_build_options");
 const cas = @import("cas.zig");
+const persistent_worker = @import("persistent_worker.zig");
 const reapi = @import("reapi.zig");
 
 pub const Error = error{
@@ -396,7 +397,7 @@ fn writeCgroupValue(
     });
 }
 
-fn prepareChrootWritableDirs(
+pub fn prepareChrootWritableDirs(
     io: std.Io,
     chroot_dir: []const u8,
     uid: u32,
@@ -588,6 +589,243 @@ fn runCommandChroot(
     };
 }
 
+pub const WorkerSpawnOptions = struct {
+    chroot_dir: []const u8,
+    chroot_cwd: []const u8 = "/workspace",
+    bind_mounts: []const BindMount = &.{},
+    cgroup_limits: CgroupLimits = .{},
+    /// Worker stderr goes to this file (opened by the caller, append mode); the
+    /// worker protocol owns stdout.
+    stderr_fd: std.posix.fd_t,
+    /// Bound on the sandbox setup handshake, not on the worker's lifetime.
+    spawn_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    cancellation: ?*const std.atomic.Value(bool) = null,
+    sandbox_uid: u32 = 65534,
+    sandbox_gid: u32 = 65534,
+};
+
+/// A long-lived worker process started by `spawnPersistentWorker`. The caller
+/// keeps the worker's chroot alive and swaps the actiondfs tree mounted under
+/// it between requests.
+pub const WorkerProcess = struct {
+    pid: std.os.linux.pid_t,
+    stdin_fd: std.posix.fd_t,
+    stdout_fd: std.posix.fd_t,
+    cgroup: Cgroup,
+    waited: bool = false,
+
+    /// Sends one framed WorkRequest and waits for the matching WorkResponse.
+    /// `error.WorkerDied` means stdout hit EOF (or stdin broke) before a
+    /// response arrived; the caller must retire the worker.
+    pub fn request(
+        self: *WorkerProcess,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        request_bytes: []const u8,
+        decoder: *persistent_worker.ResponseDecoder,
+        timeout_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
+    ) !persistent_worker.WorkResponse {
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+        const linux = std.os.linux;
+        const control = ExecutionControl{
+            .started = if (timeout_ns != null) std.Io.Clock.awake.now(io) else null,
+            .timeout_ns = timeout_ns,
+            .cancellation = cancellation,
+        };
+
+        var offset: usize = 0;
+        var write_poll = [_]linux.pollfd{
+            .{ .fd = self.stdin_fd, .events = linux.POLL.OUT | linux.POLL.ERR | linux.POLL.HUP, .revents = 0 },
+        };
+        while (offset < request_bytes.len) {
+            const poll_rc = linux.poll(&write_poll, write_poll.len, try control.pollTimeoutMilliseconds(io));
+            switch (linux.errno(poll_rc)) {
+                .SUCCESS => {
+                    if (poll_rc == 0) continue;
+                },
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
+            if (write_poll[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0) return error.WorkerDied;
+            const rc = linux.write(self.stdin_fd, request_bytes[offset..].ptr, request_bytes.len - offset);
+            switch (linux.errno(rc)) {
+                .SUCCESS => offset += rc,
+                .INTR, .AGAIN => continue,
+                .PIPE => return error.WorkerDied,
+                else => return error.Unexpected,
+            }
+        }
+
+        var read_poll = [_]linux.pollfd{
+            .{ .fd = self.stdout_fd, .events = linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR, .revents = 0 },
+        };
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const poll_rc = linux.poll(&read_poll, read_poll.len, try control.pollTimeoutMilliseconds(io));
+            switch (linux.errno(poll_rc)) {
+                .SUCCESS => {
+                    if (poll_rc == 0) continue;
+                },
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
+            const rc = linux.read(self.stdout_fd, buffer[0..].ptr, buffer.len);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return error.Unexpected,
+            }
+            const n: usize = @intCast(rc);
+            if (n == 0) return error.WorkerDied;
+            if (try decoder.feed(allocator, buffer[0..n])) |response| return response;
+        }
+    }
+
+    /// Reaps a worker that exited on its own; `null` while it is still running.
+    pub fn exitStatus(self: *WorkerProcess) !?Status {
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+        if (self.waited) return .unknown;
+        const status = try waitForPidNoHang(self.pid);
+        if (status != null) self.waited = true;
+        return status;
+    }
+
+    /// Kills the worker's whole pid namespace and releases its descriptors.
+    pub fn terminate(self: *WorkerProcess, io: std.Io, allocator: std.mem.Allocator) void {
+        if (comptime builtin.os.tag != .linux) return;
+        closeFd(self.stdin_fd);
+        closeFd(self.stdout_fd);
+        if (!self.waited) {
+            terminateActionProcesses(io, allocator, self.pid, self.cgroup);
+            _ = waitForPid(self.pid) catch {};
+            self.waited = true;
+        }
+        self.cgroup.deinit(io, allocator);
+        self.* = undefined;
+    }
+};
+
+/// Starts `argv` as a persistent worker inside `options.chroot_dir`, with the
+/// same namespaces, privilege drop and seccomp filter as a cold action but a
+/// slave mount namespace and no actiondfs mount of its own: the caller mounts
+/// the first request's input tree at `<chroot>/workspace` before spawning and
+/// remounts it per request afterwards.
+pub fn spawnPersistentWorker(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    argv_strings: []const []const u8,
+    environment: []const reapi.EnvironmentVariable,
+    options: WorkerSpawnOptions,
+) !WorkerProcess {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+    if (argv_strings.len == 0) return error.MissingArgv;
+    const linux = std.os.linux;
+    const control = ExecutionControl{
+        .started = std.Io.Clock.awake.now(io),
+        .timeout_ns = options.spawn_timeout_ns,
+        .cancellation = options.cancellation,
+    };
+    try control.check(io);
+
+    var cgroup = try Cgroup.create(io, allocator, options.cgroup_limits);
+    errdefer cgroup.deinit(io, allocator);
+
+    const chroot_z = try allocator.dupeZ(u8, options.chroot_dir);
+    defer allocator.free(chroot_z);
+    const cwd_z = try allocator.dupeZ(u8, options.chroot_cwd);
+    defer allocator.free(cwd_z);
+    const command: reapi.Command = .{
+        .arguments = argv_strings,
+        .environment_variables = environment,
+    };
+    var exec_candidates: std.ArrayListUnmanaged([:0]u8) = .empty;
+    defer {
+        for (exec_candidates.items) |candidate| allocator.free(candidate);
+        exec_candidates.deinit(allocator);
+    }
+    try appendExecCandidates(allocator, command, &exec_candidates);
+
+    const argv = try allocator.allocSentinel(?[*:0]const u8, argv_strings.len, null);
+    defer allocator.free(argv);
+    var owned_argv: std.ArrayListUnmanaged([:0]u8) = .empty;
+    defer {
+        for (owned_argv.items) |arg| allocator.free(arg);
+        owned_argv.deinit(allocator);
+    }
+    for (argv_strings, 0..) |arg, i| {
+        const value = try allocator.dupeZ(u8, arg);
+        try owned_argv.append(allocator, value);
+        argv[i] = value.ptr;
+    }
+    const envp = try allocator.allocSentinel(?[*:0]const u8, environment.len, null);
+    defer allocator.free(envp);
+    var owned_envp: std.ArrayListUnmanaged([:0]u8) = .empty;
+    defer {
+        for (owned_envp.items) |env| allocator.free(env);
+        owned_envp.deinit(allocator);
+    }
+    for (environment, 0..) |variable, i| {
+        const value = try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ variable.name, variable.value }, 0);
+        try owned_envp.append(allocator, value);
+        envp[i] = value.ptr;
+    }
+
+    var stdin_pipe = try OwnedPipe.init();
+    defer stdin_pipe.deinit();
+    var stdout_pipe = try OwnedPipe.init();
+    defer stdout_pipe.deinit();
+    var setup_pipe = try OwnedPipe.init();
+    defer setup_pipe.deinit();
+
+    try control.check(io);
+    const pid = try forkAction(.{
+        .stdin_pipe = stdin_pipe.borrow(),
+        .stdout_pipe = stdout_pipe.borrow(),
+        // The child dup2s index 1 onto stderr and closes both; -1 is ignored.
+        .stderr_pipe = .{ -1, options.stderr_fd },
+        .setup_pipe = setup_pipe.borrow(),
+        .chroot_dir = chroot_z,
+        .cwd = cwd_z,
+        .exec_candidates = exec_candidates.items,
+        .argv = argv.ptr,
+        .envp = envp.ptr,
+        .bind_mounts = options.bind_mounts,
+        .actiondfs_mounts = &.{},
+        .cgroup_procs_path = if (cgroup.procs_path) |path| path.ptr else null,
+        .sandbox_uid = options.sandbox_uid,
+        .sandbox_gid = options.sandbox_gid,
+        .mount_propagation = .slave,
+    });
+    errdefer {
+        terminateActionProcesses(io, allocator, pid, cgroup);
+        _ = waitForPid(pid) catch {};
+    }
+
+    stdin_pipe.close(0);
+    stdout_pipe.close(1);
+    setup_pipe.close(1);
+    const setup_signaled = try readSetupSignal(io, setup_pipe.endpoint(0), control);
+    setup_pipe.close(0);
+    if (!setup_signaled) return error.SandboxSetupFailed;
+
+    // Our pipe ends are non-blocking so request writes and response reads can
+    // honor deadlines and cancellation; the worker's ends stay blocking.
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    for ([_]std.posix.fd_t{ stdin_pipe.endpoint(1), stdout_pipe.endpoint(0) }) |fd| {
+        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(flags) != .SUCCESS) return error.Unexpected;
+        if (linux.errno(linux.fcntl(fd, linux.F.SETFL, flags | nonblock)) != .SUCCESS) return error.Unexpected;
+    }
+
+    return .{
+        .pid = pid,
+        .stdin_fd = stdin_pipe.release(1),
+        .stdout_fd = stdout_pipe.release(0),
+        .cgroup = cgroup,
+    };
+}
+
 const ForkAction = struct {
     stdin_pipe: [2]std.posix.fd_t,
     stdout_pipe: [2]std.posix.fd_t,
@@ -603,6 +841,24 @@ const ForkAction = struct {
     cgroup_procs_path: ?[*:0]const u8,
     sandbox_uid: u32,
     sandbox_gid: u32,
+    mount_propagation: MountPropagation = .private,
+};
+
+/// How the child's mount namespace relates to the guest's. Cold actions are
+/// fully private. Persistent workers are slaves: mounts the guest makes under
+/// the worker root (the per-request actiondfs tree) propagate in, nothing
+/// propagates out.
+pub const MountPropagation = enum {
+    private,
+    slave,
+
+    fn flags(self: MountPropagation) u32 {
+        const linux = std.os.linux;
+        return switch (self) {
+            .private => linux.MS.PRIVATE | linux.MS.REC,
+            .slave => linux.MS.SLAVE | linux.MS.REC,
+        };
+    }
 };
 
 const child_setup_fd: std.posix.fd_t = 3;
@@ -639,7 +895,7 @@ fn forkAction(action: ForkAction) !std.os.linux.pid_t {
     childEnterSandboxProcess();
     if (action.cgroup_procs_path) |path| childWriteFile(path, "0\n");
     childBringUpLoopback();
-    childSyscallName(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0), "mount_private");
+    childSyscallName(linux.mount(null, "/", null, action.mount_propagation.flags(), 0), "mount_propagation");
     for (action.actiondfs_mounts) |mount| switch (mount) {
         .strict => |strict| childMountActiondfsStrict(strict),
         .overlay => |overlay| childMountActiondfsOverlay(overlay),

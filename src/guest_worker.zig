@@ -6,6 +6,7 @@ const bytestream_service = @import("bytestream_service.zig");
 const cas = @import("cas.zig");
 const control_protocol = @import("control_protocol.zig");
 const grpc_http2_server = @import("grpc_http2_server.zig");
+const persistent_worker = @import("persistent_worker.zig");
 const reapi_dispatch = @import("reapi_dispatch.zig");
 const staged_cas_index = @import("staged_cas_index.zig");
 const vsock = @import("vsock.zig");
@@ -18,6 +19,36 @@ pub const guest_cas_root_path = "/cas";
 pub const guest_cas_blob_root_path = guest_cas_root_path ++ "/blobs/sha256";
 pub const guest_actiondfs_stage_name = "actiondfs-stage";
 pub const guest_actiondfs_stage_root_path = guest_cas_root_path ++ "/" ++ guest_actiondfs_stage_name;
+pub const guest_worker_root_name = "workers";
+pub const guest_worker_root_path = "/work/" ++ guest_worker_root_name;
+
+/// The running guest's pool, for the stats control method.
+var guest_worker_pool: ?*persistent_worker.Pool = null;
+
+/// Budget from the guest's own memory and vCPU count, overridable with
+/// `actiond.persistent_workers=<N>` on the kernel command line (0 disables).
+fn guestWorkerConfig(io: std.Io) !persistent_worker.Config {
+    var meminfo_buffer: [8192]u8 = undefined;
+    const meminfo = std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &meminfo_buffer) catch "";
+    const memory_mib = memTotalMib(meminfo) orelse 0;
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const fallback = persistent_worker.Config.fromResources(memory_mib, cpu_count);
+    var cmdline_buffer: [4096]u8 = undefined;
+    const cmdline = std.Io.Dir.cwd().readFile(io, "/proc/cmdline", &cmdline_buffer) catch "";
+    return persistent_worker.Config.fromCmdline(cmdline, fallback);
+}
+
+fn memTotalMib(meminfo: []const u8) ?u64 {
+    var lines = std.mem.splitScalar(u8, meminfo, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemTotal:")) continue;
+        var fields = std.mem.tokenizeScalar(u8, line["MemTotal:".len..], ' ');
+        const value = fields.next() orelse return null;
+        const kib = std.fmt.parseInt(u64, value, 10) catch return null;
+        return kib / 1024;
+    }
+    return null;
+}
 
 pub fn run(io: std.Io) !void {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
@@ -40,12 +71,25 @@ pub fn run(io: std.Io) !void {
     var cas_presence_index = staged_cas_index.Index{};
     defer cas_presence_index.deinit(io, allocator);
 
+    try work_dir.createDirPath(io, guest_worker_root_name);
+    var worker_pool_host = action_executor.WorkerPoolHost{ .io = io, .allocator = allocator };
+    var worker_pool = persistent_worker.Pool.init(
+        try guestWorkerConfig(io),
+        &worker_pool_host,
+        action_executor.destroyPoolWorker,
+    );
+    defer worker_pool.deinit(allocator);
+    guest_worker_pool = &worker_pool;
+    logGuestInfo(io, "linux-actiond guest persistent workers max={d}\n", .{worker_pool.config.max_workers});
+
     const execution_options = try action_executor.prepareExecuteOptions(io, allocator, cas.Store.initReady(cas_dir), .{
         .allow_kvm = true,
         .runtime_root_path = "/runtimes",
         .cas_blob_root_path = guest_cas_blob_root_path,
         .actiondfs_stage_root_path = guest_actiondfs_stage_root_path,
         .staged_cas_index = &cas_presence_index,
+        .worker_pool = &worker_pool,
+        .worker_root_path = guest_worker_root_path,
     });
 
     const server: reapi_dispatch.Server = .{
@@ -231,7 +275,18 @@ fn readActiondfsStats(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     try cas.appendPutFileStats(allocator, &out);
     try bytestream_service.appendStats(allocator, &out);
     try grpc_http2_server.appendStats(allocator, &out);
+    if (guest_worker_pool) |pool| try pool.appendStats(io, allocator, &out);
     return try out.toOwnedSlice(allocator);
+}
+
+test "guest worker reads MemTotal from /proc/meminfo" {
+    try std.testing.expectEqual(@as(?u64, 16384), memTotalMib("MemTotal:       16777216 kB\nMemFree:  1 kB\n"));
+    try std.testing.expectEqual(@as(?u64, null), memTotalMib("MemFree:  1 kB\n"));
+    try std.testing.expectEqual(@as(?u64, null), memTotalMib("MemTotal: lots kB\n"));
+}
+
+test "guest worker keeps worker chroots under /work" {
+    try std.testing.expectEqualStrings("/work/workers", guest_worker_root_path);
 }
 
 fn readFd(fd: std.Io.File.Handle, buffer: []u8) !usize {

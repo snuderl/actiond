@@ -3,6 +3,7 @@ const std = @import("std");
 const action_runner = @import("action_runner.zig");
 const build_options = @import("actiond_build_options");
 const cas = @import("cas.zig");
+const persistent_worker = @import("persistent_worker.zig");
 const protobuf = @import("protobuf_wire.zig");
 const reapi = @import("reapi.zig");
 const staged_cas_index = @import("staged_cas_index.zig");
@@ -89,6 +90,11 @@ pub const ExecuteOptions = struct {
     staged_cas_index: ?*staged_cas_index.Index = null,
     runtime_mount_cache: ?RuntimeMountCache = null,
     cancellation: ?*const std.atomic.Value(bool) = null,
+    /// Warm worker pool for actions carrying `persistentWorkerKey`; null keeps
+    /// every action on the cold path.
+    worker_pool: ?*persistent_worker.Pool = null,
+    /// Directory that holds the long-lived worker chroots (`w<id>`).
+    worker_root_path: ?[]const u8 = null,
 };
 
 pub const PreparedExecuteOptions = struct {
@@ -288,6 +294,44 @@ pub fn executeDecodedActionWithOptions(
     }
     try checkExecutionCancellation(options.cancellation);
 
+    if (options.worker_pool) |pool| {
+        if (pool.enabled() and actiondfs_mode == .actiondfs_strict) {
+            var worker_plan = try persistent_worker.Plan.fromCommand(allocator, command, platform);
+            if (worker_plan) |*plan| {
+                defer plan.deinit(allocator);
+                if (executeWithWorker(
+                    io,
+                    allocator,
+                    store,
+                    pool,
+                    action_digest,
+                    action,
+                    command,
+                    platform,
+                    input_root_digest,
+                    input_output_directories.items,
+                    plan.*,
+                    options,
+                    worker_start_wall,
+                )) |outcome| {
+                    return outcome;
+                } else |err| {
+                    const any_err: anyerror = err;
+                    switch (any_err) {
+                        error.ExecutionCancelled,
+                        error.ExecutionDeadlineExceeded,
+                        error.OutOfMemory,
+                        => return err,
+                        else => {
+                            pool.recordFallback(io);
+                            logWorkerEvent(io, "persistent worker fallback key={s} err={s}", .{ plan.key, @errorName(err) });
+                        },
+                    }
+                }
+            }
+        }
+    }
+
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cwd_len = try work_root.realPath(io, &cwd_buffer);
     const work_root_path = cwd_buffer[0..cwd_len];
@@ -350,38 +394,10 @@ pub fn executeDecodedActionWithOptions(
         break :cwd value;
     };
 
-    const libc_runtime = try libcRuntimeFromPlatform(platform);
-    const shell_runtime = try shellRuntimeFromPlatform(platform);
     var bind_mounts: std.ArrayListUnmanaged(action_runner.BindMount) = .empty;
     var borrowed_source_count: usize = 0;
-    defer {
-        for (bind_mounts.items, 0..) |mount, i| {
-            if (i >= borrowed_source_count) allocator.free(mount.source);
-            allocator.free(mount.target);
-        }
-        bind_mounts.deinit(allocator);
-    }
-    if (options.runtime_mount_cache) |cache| {
-        borrowed_source_count = std.math.maxInt(usize);
-        try checkExecutionCancellation(options.cancellation);
-        try appendCachedRuntimeMount(io, allocator, work_root, work_root_path, cache.common_etc, "etc", &bind_mounts);
-        if (libc_runtime) |libc| {
-            try checkExecutionCancellation(options.cancellation);
-            const sources = cache.forLibc(libc) orelse return error.UnsupportedLibcRuntime;
-            try appendCachedLibcRuntimeMounts(io, allocator, work_root, work_root_path, sources, &bind_mounts);
-        }
-        if (shell_runtime) |shell| {
-            try checkExecutionCancellation(options.cancellation);
-            const sources = cache.forShell(shell) orelse return error.UnsupportedShellRuntime;
-            try appendCachedShellRuntimeMounts(io, allocator, work_root, work_root_path, sources, &bind_mounts);
-        }
-        borrowed_source_count = bind_mounts.items.len;
-    } else {
-        return error.MissingRuntimeMountCache;
-    }
-    try checkExecutionCancellation(options.cancellation);
-    try appendDevMounts(io, allocator, work_root, work_root_path, &bind_mounts, options.allow_kvm);
-    try checkExecutionCancellation(options.cancellation);
+    defer freeBindMounts(allocator, &bind_mounts, borrowed_source_count);
+    try appendChrootMounts(io, allocator, work_root, work_root_path, platform, options, &bind_mounts, &borrowed_source_count);
 
     const input_fetch_completed_wall = timestampNow(io);
     const input_fetch_completed = executorTimingNow(io);
@@ -402,32 +418,16 @@ pub fn executeDecodedActionWithOptions(
     const execution_completed = executorTimingNow(io);
     const output_upload_start_wall = timestampNow(io);
     const output_upload_start = executorTimingNow(io);
-    try checkExecutionCancellation(options.cancellation);
-    if (options.staged_cas_index) |index| {
-        if (outcome.stdout_digest) |digest| try index.add(io, allocator, digest);
-        if (outcome.stderr_digest) |digest| try index.add(io, allocator, digest);
-    }
-    try actiondfs_workspace.mountForCollection();
-    var collection_namespace = try ActiondfsCollectionNamespace.init(
+    try collectOutcomeOutputs(
         io,
+        allocator,
+        store,
+        options,
         &actiondfs_workspace,
         work_root,
         actiondfs_stage_dir,
         bind_mounts.items,
         command,
-    );
-    defer collection_namespace.deinit(io);
-    var output_dir = try std.Io.Dir.openDirAbsolute(io, actiondfs_workspace.collectionPath(), .{ .iterate = true });
-    defer output_dir.close(io);
-    try collectOutputFilesWithCancellation(
-        io,
-        allocator,
-        store,
-        options.staged_cas_index,
-        output_dir,
-        command,
-        collection_namespace.lookup(work_root),
-        options.cancellation,
         &outcome,
     );
     const output_upload_completed_wall = timestampNow(io);
@@ -463,6 +463,426 @@ pub fn executeDecodedActionWithOptions(
         );
         if (outcome.runner_timing) |timing| logRunnerTiming(action_digest, timing);
     }
+    try checkExecutionCancellation(options.cancellation);
+    return outcome;
+}
+
+const default_run_options: action_runner.RunOptions = .{ .chroot_dir = "" };
+const persistent_worker_name = "actiond-worker";
+const worker_stderr_log_bytes = 4096;
+
+fn freeBindMounts(
+    allocator: std.mem.Allocator,
+    bind_mounts: *std.ArrayListUnmanaged(action_runner.BindMount),
+    borrowed_source_count: usize,
+) void {
+    for (bind_mounts.items, 0..) |mount, i| {
+        if (i >= borrowed_source_count) allocator.free(mount.source);
+        allocator.free(mount.target);
+    }
+    bind_mounts.deinit(allocator);
+}
+
+/// Runtime (`/etc`, libc, bash) and `/dev` bind mounts for a chroot. The first
+/// `borrowed_source_count` entries borrow their source path from the runtime
+/// mount cache; the rest own both paths.
+fn appendChrootMounts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    chroot_dir: std.Io.Dir,
+    chroot_path: []const u8,
+    platform: ?reapi.Platform,
+    options: ExecuteOptions,
+    bind_mounts: *std.ArrayListUnmanaged(action_runner.BindMount),
+    borrowed_source_count: *usize,
+) !void {
+    const libc_runtime = try libcRuntimeFromPlatform(platform);
+    const shell_runtime = try shellRuntimeFromPlatform(platform);
+    const cache = options.runtime_mount_cache orelse return error.MissingRuntimeMountCache;
+    borrowed_source_count.* = std.math.maxInt(usize);
+    try checkExecutionCancellation(options.cancellation);
+    try appendCachedRuntimeMount(io, allocator, chroot_dir, chroot_path, cache.common_etc, "etc", bind_mounts);
+    if (libc_runtime) |libc| {
+        try checkExecutionCancellation(options.cancellation);
+        const sources = cache.forLibc(libc) orelse return error.UnsupportedLibcRuntime;
+        try appendCachedLibcRuntimeMounts(io, allocator, chroot_dir, chroot_path, sources, bind_mounts);
+    }
+    if (shell_runtime) |shell| {
+        try checkExecutionCancellation(options.cancellation);
+        const sources = cache.forShell(shell) orelse return error.UnsupportedShellRuntime;
+        try appendCachedShellRuntimeMounts(io, allocator, chroot_dir, chroot_path, sources, bind_mounts);
+    }
+    borrowed_source_count.* = bind_mounts.items.len;
+    try checkExecutionCancellation(options.cancellation);
+    try appendDevMounts(io, allocator, chroot_dir, chroot_path, bind_mounts, options.allow_kvm);
+    try checkExecutionCancellation(options.cancellation);
+}
+
+/// Hashes stdout/stderr into the presence index and collects the declared
+/// outputs from the actiondfs stage into `outcome`.
+fn collectOutcomeOutputs(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: cas.Store,
+    options: ExecuteOptions,
+    workspace: *ActiondfsWorkspace,
+    work_root: std.Io.Dir,
+    stage_dir: std.Io.Dir,
+    bind_mounts: []const action_runner.BindMount,
+    command: reapi.Command,
+    outcome: *action_runner.Outcome,
+) !void {
+    try checkExecutionCancellation(options.cancellation);
+    if (options.staged_cas_index) |index| {
+        if (outcome.stdout_digest) |digest| try index.add(io, allocator, digest);
+        if (outcome.stderr_digest) |digest| try index.add(io, allocator, digest);
+    }
+    try workspace.mountForCollection();
+    var collection_namespace = try ActiondfsCollectionNamespace.init(
+        io,
+        workspace,
+        work_root,
+        stage_dir,
+        bind_mounts,
+        command,
+    );
+    defer collection_namespace.deinit(io);
+    var output_dir = try std.Io.Dir.openDirAbsolute(io, workspace.collectionPath(), .{ .iterate = true });
+    defer output_dir.close(io);
+    try collectOutputFilesWithCancellation(
+        io,
+        allocator,
+        store,
+        options.staged_cas_index,
+        output_dir,
+        command,
+        collection_namespace.lookup(work_root),
+        options.cancellation,
+        outcome,
+    );
+}
+
+/// Worker events are the evidence that an action ran warm; they bypass
+/// `std.log` because release builds compile info logging out.
+fn logWorkerEvent(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &buffer);
+    const stderr = &stderr_writer.interface;
+    stderr.print(fmt ++ "\n", args) catch {};
+    stderr.flush() catch {};
+}
+
+/// Per-worker chroot and process state, attached to `Pool.Worker.process`.
+pub const WorkerState = struct {
+    id: u64,
+    protocol: persistent_worker.Protocol,
+    root_path: []u8,
+    root_path_z: [:0]u8,
+    root_dir: std.Io.Dir,
+    workspace_path: [:0]u8,
+    stderr_path: []u8,
+    stderr_fd: std.posix.fd_t,
+    bind_mounts: std.ArrayListUnmanaged(action_runner.BindMount) = .empty,
+    borrowed_source_count: usize = 0,
+    root_shared: bool = false,
+    process: ?action_runner.WorkerProcess = null,
+    requests: u64 = 0,
+
+    fn truncateStderr(self: *WorkerState) void {
+        if (comptime builtin.os.tag != .linux) return;
+        _ = std.os.linux.ftruncate(self.stderr_fd, 0);
+    }
+
+    fn stderrTail(self: *WorkerState, io: std.Io, buffer: []u8) []const u8 {
+        var file = std.Io.Dir.cwd().openFile(io, self.stderr_path, .{}) catch return "";
+        defer file.close(io);
+        const stat = file.stat(io) catch return "";
+        const size: u64 = stat.size;
+        const offset: u64 = if (size > buffer.len) size - buffer.len else 0;
+        if (comptime builtin.os.tag != .linux) return "";
+        const rc = std.os.linux.pread(file.handle, buffer.ptr, buffer.len, @intCast(offset));
+        if (std.os.linux.errno(rc) != .SUCCESS) return "";
+        return buffer[0..rc];
+    }
+
+    fn deinit(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator) void {
+        if (self.process) |*process| process.terminate(io, allocator);
+        if (comptime builtin.os.tag == .linux) {
+            unmountCollectionTarget(self.workspace_path);
+            if (self.root_shared) unmountCollectionTarget(self.root_path_z);
+            _ = std.os.linux.close(self.stderr_fd);
+        }
+        self.root_dir.close(io);
+        std.Io.Dir.cwd().deleteTree(io, self.root_path) catch |err| {
+            std.log.warn("failed to remove worker root {s}: {s}", .{ self.root_path, @errorName(err) });
+        };
+        std.Io.Dir.cwd().deleteFile(io, self.stderr_path) catch {};
+        freeBindMounts(allocator, &self.bind_mounts, self.borrowed_source_count);
+        allocator.free(self.workspace_path);
+        allocator.free(self.stderr_path);
+        allocator.free(self.root_path_z);
+        allocator.free(self.root_path);
+        allocator.destroy(self);
+    }
+};
+
+/// Context for the pool's destroy hook: the pool only knows `*anyopaque`.
+pub const WorkerPoolHost = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+};
+
+pub fn destroyPoolWorker(context: *anyopaque, worker: *persistent_worker.Pool.Worker) void {
+    const host: *WorkerPoolHost = @ptrCast(@alignCast(context));
+    const opaque_state = worker.process orelse return;
+    const state: *WorkerState = @ptrCast(@alignCast(opaque_state));
+    logWorkerEvent(host.io, "persistent worker retired worker={d} requests={d}", .{ state.id, state.requests });
+    state.deinit(host.io, host.allocator);
+    worker.process = null;
+}
+
+fn createWorkerState(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    worker_root_path: []const u8,
+    id: u64,
+    protocol: persistent_worker.Protocol,
+    platform: ?reapi.Platform,
+    options: ExecuteOptions,
+) !*WorkerState {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+    const linux = std.os.linux;
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/w{d}", .{ worker_root_path, id });
+    errdefer allocator.free(root_path);
+    const root_path_z = try allocator.dupeZ(u8, root_path);
+    errdefer allocator.free(root_path_z);
+    const workspace_path = try std.fmt.allocPrintSentinel(allocator, "{s}/workspace", .{root_path}, 0);
+    errdefer allocator.free(workspace_path);
+    const stderr_path = try std.fmt.allocPrint(allocator, "{s}.stderr", .{root_path});
+    errdefer allocator.free(stderr_path);
+
+    try std.Io.Dir.cwd().createDirPath(io, root_path);
+    errdefer std.Io.Dir.cwd().deleteTree(io, root_path) catch {};
+    var root_dir = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true });
+    errdefer root_dir.close(io);
+    try prepareChrootBaseDirs(io, root_dir);
+    try root_dir.createDirPath(io, "workspace");
+
+    const state = try allocator.create(WorkerState);
+    errdefer allocator.destroy(state);
+    state.* = .{
+        .id = id,
+        .protocol = protocol,
+        .root_path = root_path,
+        .root_path_z = root_path_z,
+        .root_dir = root_dir,
+        .workspace_path = workspace_path,
+        .stderr_path = stderr_path,
+        .stderr_fd = -1,
+    };
+    errdefer freeBindMounts(allocator, &state.bind_mounts, state.borrowed_source_count);
+    try appendChrootMounts(io, allocator, root_dir, root_path, platform, options, &state.bind_mounts, &state.borrowed_source_count);
+    try action_runner.prepareChrootWritableDirs(io, root_path, default_run_options.sandbox_uid, default_run_options.sandbox_gid);
+
+    const stderr_path_z = try allocator.dupeZ(u8, stderr_path);
+    defer allocator.free(stderr_path_z);
+    const stderr_rc = linux.open(stderr_path_z.ptr, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o644);
+    if (linux.errno(stderr_rc) != .SUCCESS) return error.Unexpected;
+    state.stderr_fd = @intCast(stderr_rc);
+    errdefer _ = linux.close(state.stderr_fd);
+
+    // A shared self-bind of the worker root gives per-request mounts under it a
+    // peer group, so they propagate into the worker's slave mount namespace.
+    if (linux.errno(linux.mount(root_path_z.ptr, root_path_z.ptr, null, linux.MS.BIND, 0)) != .SUCCESS) return error.MountFailed;
+    state.root_shared = true;
+    errdefer unmountCollectionTarget(root_path_z);
+    if (linux.errno(linux.mount(null, root_path_z.ptr, null, linux.MS.SHARED, 0)) != .SUCCESS) return error.MountFailed;
+    return state;
+}
+
+const WorkspaceFlagfiles = struct {
+    io: std.Io,
+    workspace_path: []const u8,
+
+    fn read(context: *anyopaque, allocator: std.mem.Allocator, path: []const u8) anyerror![]u8 {
+        const self: *WorkspaceFlagfiles = @ptrCast(@alignCast(context));
+        try validatePath(path);
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_path, path });
+        defer allocator.free(full_path);
+        return try std.Io.Dir.cwd().readFileAlloc(self.io, full_path, allocator, .limited(persistent_worker.max_flagfile_bytes + 1));
+    }
+
+    fn reader(self: *WorkspaceFlagfiles) persistent_worker.FlagfileReader {
+        return .{ .context = self, .read = read };
+    }
+};
+
+fn workerExitStatus(exit_code: i32) action_runner.Status {
+    if (exit_code >= 0 and exit_code <= 255) return .{ .exited = @intCast(exit_code) };
+    return .{ .exited = 1 };
+}
+
+/// Runs the action in a warm worker. Errors other than cancellation and
+/// deadline exceeded make the caller fall back to the cold path; the worker
+/// that failed has been retired by then.
+fn executeWithWorker(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: cas.Store,
+    pool: *persistent_worker.Pool,
+    action_digest: cas.Digest,
+    action: reapi.Action,
+    command: reapi.Command,
+    platform: ?reapi.Platform,
+    input_root_digest: cas.Digest,
+    input_output_directories: []const []const u8,
+    plan: persistent_worker.Plan,
+    options: ExecuteOptions,
+    worker_start_wall: reapi.Timestamp,
+) !action_runner.Outcome {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+    const worker_root_path = options.worker_root_path orelse return error.MissingWorkerRoot;
+    const cas_blob_root_path = options.cas_blob_root_path orelse return error.MissingCasBlobRoot;
+    const timeout_ns: ?u64 = if (action.timeout) |timeout| try timeout.toNanoseconds() else null;
+
+    const acquired = try pool.acquire(io, allocator, plan.pool_key, options.cancellation);
+    const worker = acquired.worker;
+    var healthy = false;
+    defer pool.release(io, allocator, worker, healthy);
+
+    if (acquired.fresh) {
+        worker.process = try createWorkerState(io, allocator, worker_root_path, worker.id, plan.protocol, platform, options);
+    }
+    const state: *WorkerState = @ptrCast(@alignCast(worker.process.?));
+    if (state.protocol != plan.protocol) return error.WorkerProtocolMismatch;
+
+    var workspace = try ActiondfsWorkspace.init(
+        io,
+        allocator,
+        cas_blob_root_path,
+        options.actiondfs_stage_root_path,
+        state.root_path,
+        state.workspace_path,
+        input_root_digest,
+        .actiondfs_strict,
+    );
+    defer workspace.deinit(io, allocator);
+    var stage_dir = try std.Io.Dir.openDirAbsolute(io, workspace.stagePath(), .{ .iterate = true });
+    defer stage_dir.close(io);
+    prepareOutputParentsWithCancellation(io, stage_dir, command, options.cancellation) catch |err| switch (err) {
+        error.FileNotFound => return error.OutputParentCreateFailed,
+        else => return err,
+    };
+    try prepareInputOutputDirectoriesWithCancellation(io, stage_dir, input_output_directories, options.cancellation);
+    try action_runner.prepareChrootWritableDirs(io, workspace.stagePath(), default_run_options.sandbox_uid, default_run_options.sandbox_gid);
+    try checkExecutionCancellation(options.cancellation);
+    try workspace.mountWorkspace();
+
+    const input_fetch_completed_wall = timestampNow(io);
+    if (state.process == null) {
+        state.process = try action_runner.spawnPersistentWorker(io, allocator, plan.startup_args, command.environment_variables, .{
+            .chroot_dir = state.root_path,
+            .chroot_cwd = "/workspace",
+            .bind_mounts = state.bind_mounts.items,
+            .cgroup_limits = action_runner.CgroupLimits.fromPlatform(platform),
+            .stderr_fd = state.stderr_fd,
+            .cancellation = options.cancellation,
+        });
+        logWorkerEvent(io, "persistent worker spawned key={s} worker={d} pid={d} argv0={s}", .{
+            plan.key,
+            state.id,
+            state.process.?.pid,
+            plan.startup_args[0],
+        });
+    }
+    state.truncateStderr();
+
+    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = state.workspace_path };
+    const arguments = try persistent_worker.expandRequestArguments(allocator, plan.flagfile_args, flagfiles.reader());
+    defer {
+        persistent_worker.freeArguments(allocator, arguments);
+        allocator.free(arguments);
+    }
+    const request_bytes = try persistent_worker.encodeWorkRequest(allocator, plan.protocol, arguments, 0);
+    defer allocator.free(request_bytes);
+    var decoder = persistent_worker.ResponseDecoder.init(plan.protocol);
+    defer decoder.deinit(allocator);
+
+    const execution_start_wall = timestampNow(io);
+    const execution_start = std.Io.Clock.awake.now(io);
+    const response = state.process.?.request(io, allocator, request_bytes, &decoder, timeout_ns, options.cancellation) catch |err| {
+        var tail_buffer: [worker_stderr_log_bytes]u8 = undefined;
+        var action_hash: [64]u8 = undefined;
+        logWorkerEvent(io, "persistent worker request failed key={s} worker={d} action={s} err={s} stderr_tail={s}", .{
+            plan.key,
+            state.id,
+            action_digest.formatHex(&action_hash),
+            @errorName(err),
+            state.stderrTail(io, &tail_buffer),
+        });
+        return err;
+    };
+    const execution_completed_wall = timestampNow(io);
+    const execution_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms);
+    workspace.unmountWorkspace();
+    // The process answered, so it stays in the pool; a non-zero exit code is a
+    // normal failed action, not a broken worker.
+    healthy = true;
+    state.requests += 1;
+
+    const stderr_bytes = try allocator.dupe(u8, response.output);
+    errdefer allocator.free(stderr_bytes);
+    const stdout_bytes = try allocator.alloc(u8, 0);
+    errdefer allocator.free(stdout_bytes);
+    var outcome: action_runner.Outcome = .{
+        .status = workerExitStatus(response.exit_code),
+        .stdout = stdout_bytes,
+        .stderr = stderr_bytes,
+        .stderr_digest = if (stderr_bytes.len != 0) try store.putBytes(io, stderr_bytes) else null,
+    };
+    errdefer outcome.deinit(allocator);
+
+    const output_upload_start_wall = timestampNow(io);
+    try collectOutcomeOutputs(
+        io,
+        allocator,
+        store,
+        options,
+        &workspace,
+        state.root_dir,
+        stage_dir,
+        state.bind_mounts.items,
+        command,
+        &outcome,
+    );
+    const output_upload_completed_wall = timestampNow(io);
+    outcome.execution_metadata = .{
+        .worker = persistent_worker_name,
+        .queued_timestamp = worker_start_wall,
+        .worker_start_timestamp = worker_start_wall,
+        .worker_completed_timestamp = output_upload_completed_wall,
+        .input_fetch_start_timestamp = worker_start_wall,
+        .input_fetch_completed_timestamp = input_fetch_completed_wall,
+        .execution_start_timestamp = execution_start_wall,
+        .execution_completed_timestamp = execution_completed_wall,
+        .output_upload_start_timestamp = output_upload_start_wall,
+        .output_upload_completed_timestamp = output_upload_completed_wall,
+    };
+    var action_hash: [64]u8 = undefined;
+    logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d}", .{
+        plan.key,
+        state.id,
+        state.requests,
+        action_digest.formatHex(&action_hash),
+        response.exit_code,
+        execution_elapsed_ms,
+    });
     try checkExecutionCancellation(options.cancellation);
     return outcome;
 }
@@ -508,6 +928,7 @@ const ActiondfsWorkspace = struct {
     overlay_data: ?[:0]u8 = null,
     mounts: [1]action_runner.ActiondfsMount,
     collection_mounted: bool = false,
+    workspace_mounted: bool = false,
 
     fn init(
         io: std.Io,
@@ -637,6 +1058,39 @@ const ActiondfsWorkspace = struct {
         self.collection_mounted = true;
     }
 
+    /// Mounts the strict input tree at the workspace path from the guest's own
+    /// mount namespace. Persistent workers see it through mount propagation;
+    /// cold actions never need this because their child mounts it itself.
+    fn mountWorkspace(self: *ActiondfsWorkspace) !void {
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+        if (self.workspace_mounted) return;
+        const mount = switch (self.mounts[0]) {
+            .strict => |strict| strict,
+            .overlay => return error.UnsupportedMountMode,
+        };
+        const linux = std.os.linux;
+        const rc = linux.mount(
+            mount.fstype.ptr,
+            mount.target.ptr,
+            mount.fstype.ptr,
+            linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOATIME,
+            @intFromPtr(mount.actiondfs_data.ptr),
+        );
+        if (linux.errno(rc) != .SUCCESS) return error.MountFailed;
+        self.workspace_mounted = true;
+    }
+
+    /// Lazily detaches the workspace mount; files a worker still holds open
+    /// stay readable until it closes them.
+    fn unmountWorkspace(self: *ActiondfsWorkspace) void {
+        if (!self.workspace_mounted) return;
+        switch (self.mounts[0]) {
+            .strict => |strict| unmountCollectionTarget(strict.target),
+            .overlay => {},
+        }
+        self.workspace_mounted = false;
+    }
+
     fn stagePath(self: *const ActiondfsWorkspace) [:0]const u8 {
         return self.stage_dir;
     }
@@ -649,6 +1103,7 @@ const ActiondfsWorkspace = struct {
     }
 
     fn deinit(self: *ActiondfsWorkspace, io: std.Io, allocator: std.mem.Allocator) void {
+        self.unmountWorkspace();
         if (comptime builtin.os.tag == .linux) {
             if (self.collection_mounted) {
                 if (self.overlay_target) |target| _ = std.os.linux.umount2(target.ptr, std.os.linux.MNT.DETACH);
