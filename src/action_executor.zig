@@ -7,6 +7,7 @@ const persistent_worker = @import("persistent_worker.zig");
 const protobuf = @import("protobuf_wire.zig");
 const reapi = @import("reapi.zig");
 const staged_cas_index = @import("staged_cas_index.zig");
+const worker_forest = @import("worker_forest.zig");
 
 const max_output_file_bytes = 1024 * 1024 * 1024;
 const max_output_depfile_bytes = 16 * 1024 * 1024;
@@ -686,168 +687,16 @@ pub const WorkerState = struct {
     requests: std.atomic.Value(u64) = .init(0),
     next_request_id: std.atomic.Value(i32) = .init(1),
 
-    // Shared-execroot state for multiplex workers. Bazel's local multiplex
-    // workers share one execroot; here `/merged` (a symlink to `/m/<gen>`) is
-    // an overlay whose lowers are the actiondfs trees of every in-flight
-    // request and whose upper is shared, so a tool that resolves paths against
-    // its cwd sees every in-flight input and writes outputs into one place.
-    union_mutex: std.Io.Mutex = .init,
-    inflight_trees: std.ArrayListUnmanaged(InflightTree) = .empty,
-    generation: u32 = 0,
-    /// Generations still mounted at `/m/<gen>`, each with its own upper (two
-    /// overlay mounts must never share an upperdir: overlayfs calls that
-    /// undefined and it showed up as stale negative dentries). A new
-    /// generation layers every still-relevant older upper under the in-flight
-    /// trees, so files written earlier stay visible. A generation is retired
-    /// once no in-flight request started on or before it, except
-    /// `tool_generation`: the JVM canonicalizes `java.home` through the
-    /// `/merged` symlink at startup, so that one must stay resolvable. Upper
-    /// directories are only deleted with the worker, because retired
-    /// generations' uppers may still be lowers of live ones.
-    mounted_generations: std.ArrayListUnmanaged(MountedGeneration) = .empty,
-    uppers: std.ArrayListUnmanaged(GenerationUpper) = .empty,
-    tool_generation: ?u32 = null,
-    stage_base_path: ?[]u8 = null,
-
-    const InflightTree = struct {
-        request_id: i32,
-        tree_path: [:0]const u8,
-        generation: u32,
-    };
-
-    const MountedGeneration = struct {
-        generation: u32,
-    };
-
-    const GenerationUpper = struct {
-        generation: u32,
-        upper_path: [:0]u8,
-        work_path: [:0]u8,
-    };
+    /// Multiplex workers serve every request from the execroot forest at
+    /// `/workspace` (see `worker_forest.zig`); the first request's actiondfs
+    /// tree stays mounted at `/tree` for the worker's lifetime, which is where
+    /// the tool binary and the JDK the JVM canonicalizes its paths to live.
+    forest: ?worker_forest.Forest = null,
+    tool_workspace: ?ActiondfsWorkspace = null,
 
     fn nextRequestId(self: *WorkerState) i32 {
         const id = self.next_request_id.fetchAdd(1, .monotonic);
         return if (id <= 0) 1 else id;
-    }
-
-    fn viewPath(self: *const WorkerState, allocator: std.mem.Allocator, generation: u32) ![:0]u8 {
-        return try std.fmt.allocPrintSentinel(allocator, "{s}/m/{d}", .{ self.root_path, generation }, 0);
-    }
-
-    /// Adds a request's tree to the union and publishes a new view generation.
-    fn joinUnion(
-        self: *WorkerState,
-        io: std.Io,
-        allocator: std.mem.Allocator,
-        store: cas.Store,
-        request_id: i32,
-        tree_path: [:0]const u8,
-        input_root_digest: cas.Digest,
-        cancellation: ?*const std.atomic.Value(bool),
-    ) !void {
-        if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
-        const linux = std.os.linux;
-        self.union_mutex.lockUncancelable(io);
-        defer self.union_mutex.unlock(io);
-        const next_generation = self.generation + 1;
-        // Uppers older than the oldest in-flight request's start generation
-        // hold nothing a live request can still need.
-        var oldest_in_use = next_generation;
-        for (self.inflight_trees.items) |tree| oldest_in_use = @min(oldest_in_use, tree.generation);
-        try self.inflight_trees.append(allocator, .{ .request_id = request_id, .tree_path = tree_path, .generation = next_generation });
-        errdefer _ = self.inflight_trees.pop();
-        try self.mounted_generations.ensureUnusedCapacity(allocator, 1);
-        try self.uppers.ensureUnusedCapacity(allocator, 1);
-
-        const stage_base = self.stage_base_path orelse return error.MissingStageRoot;
-        const upper_path = try std.fmt.allocPrintSentinel(allocator, "{s}/u{d}", .{ stage_base, next_generation }, 0);
-        errdefer allocator.free(upper_path);
-        const work_path = try std.fmt.allocPrintSentinel(allocator, "{s}/w{d}", .{ stage_base, next_generation }, 0);
-        errdefer allocator.free(work_path);
-        try std.Io.Dir.cwd().createDirPath(io, upper_path);
-        try std.Io.Dir.cwd().createDirPath(io, work_path);
-        try action_runner.prepareChrootWritableDirs(io, upper_path, default_run_options.sandbox_uid, default_run_options.sandbox_gid);
-
-        var lowers: std.ArrayListUnmanaged(u8) = .empty;
-        defer lowers.deinit(allocator);
-        var index = self.inflight_trees.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (lowers.items.len != 0) try lowers.append(allocator, ':');
-            try lowers.appendSlice(allocator, self.inflight_trees.items[index].tree_path);
-        }
-        var upper_index = self.uppers.items.len;
-        while (upper_index > 0) {
-            upper_index -= 1;
-            const upper = self.uppers.items[upper_index];
-            if (upper.generation < oldest_in_use) break;
-            try lowers.append(allocator, ':');
-            try lowers.appendSlice(allocator, upper.upper_path);
-        }
-        const view_path = try self.viewPath(allocator, next_generation);
-        defer allocator.free(view_path);
-        try std.Io.Dir.cwd().createDirPath(io, view_path);
-        const data = try std.fmt.allocPrintSentinel(
-            allocator,
-            "lowerdir={s},upperdir={s},workdir={s}",
-            .{ lowers.items, upper_path, work_path },
-            0,
-        );
-        defer allocator.free(data);
-        const rc = linux.mount("overlay", view_path.ptr, "overlay", linux.MS.NOSUID | linux.MS.NODEV, @intFromPtr(data.ptr));
-        if (linux.errno(rc) != .SUCCESS) return error.MountFailed;
-        errdefer unmountCollectionTarget(view_path);
-        self.uppers.appendAssumeCapacity(.{ .generation = next_generation, .upper_path = upper_path, .work_path = work_path });
-
-        var target_buffer: [32]u8 = undefined;
-        const target = try std.fmt.bufPrint(&target_buffer, "/m/{d}", .{next_generation});
-        self.root_dir.deleteFile(io, "merged.next") catch {};
-        try self.root_dir.symLink(io, target, "merged.next", .{});
-        try std.Io.Dir.rename(self.root_dir, "merged.next", self.root_dir, "merged", io);
-
-        self.mounted_generations.appendAssumeCapacity(.{ .generation = next_generation });
-        self.generation = next_generation;
-        self.pruneGenerationsLocked(io, allocator);
-        try syncWorkspaceLinksAdditive(io, allocator, store, self.root_dir, input_root_digest, cancellation);
-    }
-
-    fn leaveUnion(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator, request_id: i32) void {
-        self.union_mutex.lockUncancelable(io);
-        defer self.union_mutex.unlock(io);
-        for (self.inflight_trees.items, 0..) |tree, index| {
-            if (tree.request_id != request_id) continue;
-            _ = self.inflight_trees.orderedRemove(index);
-            break;
-        }
-        self.pruneGenerationsLocked(io, allocator);
-    }
-
-    /// Lazily detaches generations no in-flight request can still be using.
-    fn pruneGenerationsLocked(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator) void {
-        var oldest_in_use = self.generation;
-        for (self.inflight_trees.items) |tree| oldest_in_use = @min(oldest_in_use, tree.generation);
-        var index: usize = 0;
-        while (index < self.mounted_generations.items.len) {
-            const generation = self.mounted_generations.items[index].generation;
-            const keep = generation == self.generation or generation >= oldest_in_use or
-                (self.tool_generation != null and generation <= self.tool_generation.?);
-            if (keep) {
-                index += 1;
-                continue;
-            }
-            if (self.viewPath(allocator, generation)) |view| {
-                defer allocator.free(view);
-                unmountCollectionTarget(view);
-                std.Io.Dir.cwd().deleteDir(io, view) catch {};
-            } else |_| {}
-            _ = self.mounted_generations.orderedRemove(index);
-        }
-    }
-
-    fn currentViewPath(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator) ![:0]u8 {
-        self.union_mutex.lockUncancelable(io);
-        defer self.union_mutex.unlock(io);
-        return try self.viewPath(allocator, self.generation);
     }
 
     fn truncateStderr(self: *WorkerState) void {
@@ -870,26 +719,11 @@ pub const WorkerState = struct {
     fn deinit(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator) void {
         if (self.multiplexer) |multiplexer| multiplexer.shutdown();
         if (self.process) |*process| process.terminate(io, allocator);
-        if (comptime builtin.os.tag == .linux) {
-            for (self.mounted_generations.items) |mounted| {
-                if (self.viewPath(allocator, mounted.generation)) |view| {
-                    defer allocator.free(view);
-                    unmountCollectionTarget(view);
-                } else |_| {}
-            }
-            for (self.inflight_trees.items) |tree| unmountCollectionTarget(tree.tree_path);
+        if (self.forest) |*forest| {
+            forest.dir.close(io);
+            forest.deinit(allocator);
         }
-        self.mounted_generations.deinit(allocator);
-        self.inflight_trees.deinit(allocator);
-        for (self.uppers.items) |upper| {
-            allocator.free(upper.upper_path);
-            allocator.free(upper.work_path);
-        }
-        self.uppers.deinit(allocator);
-        if (self.stage_base_path) |path| {
-            std.Io.Dir.cwd().deleteTree(io, path) catch {};
-            allocator.free(path);
-        }
+        if (self.tool_workspace) |*tool_workspace| tool_workspace.deinit(io, allocator);
         if (comptime builtin.os.tag == .linux) {
             unmountCollectionTarget(self.tree_path);
             if (self.root_shared) unmountCollectionTarget(self.root_path_z);
@@ -995,19 +829,34 @@ fn createWorkerState(
     if (linux.errno(linux.mount(null, root_path_z.ptr, null, linux.MS.SHARED, 0)) != .SUCCESS) return error.MountFailed;
 
     if (multiplex) {
-        // `/merged` starts as a dangling symlink; `joinUnion` publishes the
-        // first generation before the process is spawned.
-        try root_dir.createDirPath(io, "m");
-        try root_dir.createDirPath(io, "trees");
-        try root_dir.symLink(io, "/m/0", "merged", .{});
-        const stage_root = options.actiondfs_stage_root_path orelse return error.MissingStageRoot;
-        const stage_base = try std.fmt.allocPrint(allocator, "{s}/worker-{d}", .{ stage_root, id });
-        errdefer allocator.free(stage_base);
-        try std.Io.Dir.cwd().deleteTree(io, stage_base);
-        try std.Io.Dir.cwd().createDirPath(io, stage_base);
-        state.stage_base_path = stage_base;
+        // The forest's file symlinks point at CAS blobs, so the blob root is
+        // bind-mounted read-only into the chroot at the same path it has in
+        // the guest (`/cas/blobs/sha256`).
+        const cas_blob_root = options.cas_blob_root_path orelse return error.MissingCasBlobRoot;
+        const cas_rel = std.mem.trimStart(u8, cas_blob_root, "/");
+        try root_dir.createDirPath(io, cas_rel);
+        const source = try allocator.dupeZ(u8, cas_blob_root);
+        errdefer allocator.free(source);
+        const target = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ root_path, cas_rel }, 0);
+        errdefer allocator.free(target);
+        try state.bind_mounts.append(allocator, .{ .source = source, .target = target, .read_only = true });
+        var forest_dir = try root_dir.openDir(io, "workspace", .{ .iterate = true });
+        errdefer forest_dir.close(io);
+        state.forest = .{
+            .dir = forest_dir,
+            .blob_link_root = blobLinkRoot(cas_blob_root),
+            .sandbox_uid = default_run_options.sandbox_uid,
+            .sandbox_gid = default_run_options.sandbox_gid,
+        };
     }
     return state;
+}
+
+/// `/cas/blobs/sha256` -> `/cas`: the prefix `cas.blobSubPath` paths hang off.
+fn blobLinkRoot(cas_blob_root: []const u8) []const u8 {
+    const suffix = "/blobs/sha256";
+    if (std.mem.endsWith(u8, cas_blob_root, suffix)) return cas_blob_root[0 .. cas_blob_root.len - suffix.len];
+    return cas_blob_root;
 }
 
 /// Declared outputs of a command: `output_paths` when present, else the
@@ -1082,7 +931,23 @@ fn spawnWorkerProcess(
     platform: ?reapi.Platform,
     options: ExecuteOptions,
 ) !void {
-    state.process = try action_runner.spawnPersistentWorker(io, allocator, plan.startup_args, command.environment_variables, .{
+    // Multiplex workers start from the permanently mounted first tree, so the
+    // canonical paths the JVM records at startup (java.home, libjvm) never
+    // change; singleplex workers resolve argv0 through the /workspace links.
+    var startup_args = plan.startup_args;
+    var owned_argv0: ?[]u8 = null;
+    defer if (owned_argv0) |argv0| allocator.free(argv0);
+    var owned_args: ?[][]const u8 = null;
+    defer if (owned_args) |args| allocator.free(args);
+    if (state.multiplex and !std.mem.startsWith(u8, plan.startup_args[0], "/")) {
+        const argv0 = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ worker_tree_name, plan.startup_args[0] });
+        owned_argv0 = argv0;
+        const args = try allocator.dupe([]const u8, plan.startup_args);
+        args[0] = argv0;
+        owned_args = args;
+        startup_args = args;
+    }
+    state.process = try action_runner.spawnPersistentWorker(io, allocator, startup_args, command.environment_variables, .{
         .chroot_dir = state.root_path,
         .chroot_cwd = "/workspace",
         .bind_mounts = state.bind_mounts.items,
@@ -1125,48 +990,42 @@ fn executeSharedExecrootRequest(
 ) !action_runner.Outcome {
     const cas_blob_root_path = options.cas_blob_root_path orelse return error.MissingCasBlobRoot;
     const request_id = state.nextRequestId();
-    var tree_rel_buffer: [32]u8 = undefined;
-    const tree_rel = try std.fmt.bufPrint(&tree_rel_buffer, "trees/r{d}", .{request_id});
-    try state.root_dir.createDirPath(io, tree_rel);
-    defer state.root_dir.deleteDir(io, tree_rel) catch {};
-    const tree_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ state.root_path, tree_rel }, 0);
-    defer allocator.free(tree_path);
+    const forest: *worker_forest.Forest = if (state.forest) |*forest| forest else return error.WorkerProtocolMismatch;
 
-    var workspace = try ActiondfsWorkspace.init(
-        io,
-        allocator,
-        cas_blob_root_path,
-        options.actiondfs_stage_root_path,
-        state.root_path,
-        tree_path,
-        input_root_digest,
-        .actiondfs_strict,
-    );
-    defer workspace.deinit(io, allocator);
-    try checkExecutionCancellation(options.cancellation);
-    try workspace.mountWorkspace();
-    try state.joinUnion(io, allocator, store, request_id, tree_path, input_root_digest, options.cancellation);
-    defer state.leaveUnion(io, allocator, request_id);
-
-    {
-        const view_path = try state.currentViewPath(io, allocator);
-        defer allocator.free(view_path);
-        var view_dir = try std.Io.Dir.openDirAbsolute(io, view_path, .{ .iterate = true });
-        defer view_dir.close(io);
-        deleteDeclaredOutputs(io, view_dir, command);
-        prepareOutputParentsWithCancellation(io, view_dir, command, options.cancellation) catch |err| switch (err) {
-            error.FileNotFound => return error.OutputParentCreateFailed,
-            else => return err,
-        };
-        try prepareInputOutputDirectoriesWithCancellation(io, view_dir, input_output_directories, options.cancellation);
-        makeOutputParentsWritable(view_dir, command);
+    // The first request's tree stays mounted at /tree for the worker's
+    // lifetime: the tool is exec'd from there, so the JVM's canonical paths
+    // (java.home, libjvm) are stable, and every later request's tool files
+    // are the same bytes by construction of persistentWorkerKey.
+    if (state.tool_workspace == null) {
+        var tool_workspace = try ActiondfsWorkspace.init(
+            io,
+            allocator,
+            cas_blob_root_path,
+            options.actiondfs_stage_root_path,
+            state.root_path,
+            state.tree_path,
+            input_root_digest,
+            .actiondfs_strict,
+        );
+        errdefer tool_workspace.deinit(io, allocator);
+        try tool_workspace.mountWorkspace();
+        state.tool_workspace = tool_workspace;
     }
+    try checkExecutionCancellation(options.cancellation);
+    try forest.sync(io, allocator, store, input_root_digest, options.cancellation);
+    deleteDeclaredOutputs(io, forest.dir, command);
+    prepareOutputParentsWithCancellation(io, forest.dir, command, options.cancellation) catch |err| switch (err) {
+        error.FileNotFound => return error.OutputParentCreateFailed,
+        else => return err,
+    };
+    try prepareInputOutputDirectoriesWithCancellation(io, forest.dir, input_output_directories, options.cancellation);
+    makeOutputParentsWritable(forest.dir, command);
 
     const input_fetch_completed_wall = timestampNow(io);
     if (state.process == null) try spawnWorkerProcess(io, allocator, pool, worker, state, plan, command, platform, options);
     const multiplexer = state.multiplexer orelse return error.WorkerProtocolMismatch;
 
-    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = tree_path };
+    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = state.workspace_path };
     const arguments = try persistent_worker.expandRequestArguments(allocator, plan.flagfile_args, flagfiles.reader(), true);
     defer {
         persistent_worker.freeArguments(allocator, arguments);
@@ -1200,15 +1059,6 @@ fn executeSharedExecrootRequest(
     const execution_completed_wall = timestampNow(io);
     const execution_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms);
     const request_count = state.requests.fetchAdd(1, .monotonic) + 1;
-    if (request_count == 1) {
-        // The JVM canonicalized java.home (and whatever else it resolved at
-        // startup) through /merged at some point before this first response,
-        // while joiners may already have published newer generations. Pin
-        // everything up to the current one for the worker's lifetime.
-        state.union_mutex.lockUncancelable(io);
-        state.tool_generation = state.generation;
-        state.union_mutex.unlock(io);
-    }
 
     const stdout_bytes = try allocator.alloc(u8, 0);
     errdefer allocator.free(stdout_bytes);
@@ -1225,27 +1075,21 @@ fn executeSharedExecrootRequest(
     if (options.staged_cas_index) |index| {
         if (outcome.stderr_digest) |digest| try index.add(io, allocator, digest);
     }
-    // Outputs are read through the current view, which layers every upper the
-    // request may have written to, and copied into the CAS (the overlay is a
-    // different filesystem from the promote path's rename target).
-    {
-        const view_path = try state.currentViewPath(io, allocator);
-        defer allocator.free(view_path);
-        var view_dir = try std.Io.Dir.openDirAbsolute(io, view_path, .{ .iterate = true });
-        defer view_dir.close(io);
-        try collectOutputFilesWithCancellation(
-            io,
-            allocator,
-            store,
-            options.staged_cas_index,
-            view_dir,
-            command,
-            null,
-            options.cancellation,
-            &outcome,
-        );
-        deleteDeclaredOutputs(io, view_dir, command);
-    }
+    // Outputs are regular files in the forest (on the guest's root
+    // filesystem), collected by their declared paths and removed afterwards so
+    // a later action with the same path starts clean.
+    try collectOutputFilesWithCancellation(
+        io,
+        allocator,
+        store,
+        options.staged_cas_index,
+        forest.dir,
+        command,
+        null,
+        options.cancellation,
+        &outcome,
+    );
+    deleteDeclaredOutputs(io, forest.dir, command);
     const output_upload_completed_wall = timestampNow(io);
     outcome.execution_metadata = .{
         .worker = persistent_worker_name,
