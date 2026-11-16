@@ -634,28 +634,7 @@ pub const WorkerProcess = struct {
             .cancellation = cancellation,
         };
 
-        var offset: usize = 0;
-        var write_poll = [_]linux.pollfd{
-            .{ .fd = self.stdin_fd, .events = linux.POLL.OUT | linux.POLL.ERR | linux.POLL.HUP, .revents = 0 },
-        };
-        while (offset < request_bytes.len) {
-            const poll_rc = linux.poll(&write_poll, write_poll.len, try control.pollTimeoutMilliseconds(io));
-            switch (linux.errno(poll_rc)) {
-                .SUCCESS => {
-                    if (poll_rc == 0) continue;
-                },
-                .INTR => continue,
-                else => return error.Unexpected,
-            }
-            if (write_poll[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0) return error.WorkerDied;
-            const rc = linux.write(self.stdin_fd, request_bytes[offset..].ptr, request_bytes.len - offset);
-            switch (linux.errno(rc)) {
-                .SUCCESS => offset += rc,
-                .INTR, .AGAIN => continue,
-                .PIPE => return error.WorkerDied,
-                else => return error.Unexpected,
-            }
-        }
+        try self.writeRequest(io, request_bytes, control);
 
         var read_poll = [_]linux.pollfd{
             .{ .fd = self.stdout_fd, .events = linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR, .revents = 0 },
@@ -682,6 +661,42 @@ pub const WorkerProcess = struct {
         }
     }
 
+    fn writeRequest(self: *WorkerProcess, io: std.Io, request_bytes: []const u8, control: ExecutionControl) !void {
+        const linux = std.os.linux;
+        var offset: usize = 0;
+        var write_poll = [_]linux.pollfd{
+            .{ .fd = self.stdin_fd, .events = linux.POLL.OUT | linux.POLL.ERR | linux.POLL.HUP, .revents = 0 },
+        };
+        while (offset < request_bytes.len) {
+            const poll_rc = linux.poll(&write_poll, write_poll.len, try control.pollTimeoutMilliseconds(io));
+            switch (linux.errno(poll_rc)) {
+                .SUCCESS => {
+                    if (poll_rc == 0) continue;
+                },
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
+            if (write_poll[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0) return error.WorkerDied;
+            const rc = linux.write(self.stdin_fd, request_bytes[offset..].ptr, request_bytes.len - offset);
+            switch (linux.errno(rc)) {
+                .SUCCESS => offset += rc,
+                .INTR, .AGAIN => continue,
+                .PIPE => return error.WorkerDied,
+                else => return error.Unexpected,
+            }
+        }
+    }
+
+    /// Kills the worker's pid namespace and reaps it, keeping the pipe
+    /// descriptors open so a reader thread can observe EOF first.
+    pub fn kill(self: *WorkerProcess, io: std.Io, allocator: std.mem.Allocator) void {
+        if (comptime builtin.os.tag != .linux) return;
+        if (self.waited) return;
+        terminateActionProcesses(io, allocator, self.pid, self.cgroup);
+        _ = waitForPid(self.pid) catch {};
+        self.waited = true;
+    }
+
     /// Reaps a worker that exited on its own; `null` while it is still running.
     pub fn exitStatus(self: *WorkerProcess) !?Status {
         if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
@@ -703,6 +718,183 @@ pub const WorkerProcess = struct {
         }
         self.cgroup.deinit(io, allocator);
         self.* = undefined;
+    }
+};
+
+/// Serves several concurrent requests on one worker process: request ids are
+/// allocated here, a reader thread demultiplexes `WorkResponse`s by
+/// `request_id`, and writers serialize on the stdin pipe. Proto framing only.
+pub const WorkerMultiplexer = struct {
+    const Slot = struct {
+        done: bool = false,
+        failed: bool = false,
+        exit_code: i32 = 0,
+        output: ?[]u8 = null,
+    };
+
+    pub const Response = struct {
+        exit_code: i32,
+        /// Owned by the caller.
+        output: []u8,
+    };
+
+    const wait_poll_ms = 2;
+
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    process: *WorkerProcess,
+    mutex: std.Io.Mutex = .init,
+    write_mutex: std.Io.Mutex = .init,
+    slots: std.AutoHashMapUnmanaged(i32, *Slot) = .empty,
+    next_request_id: i32 = 1,
+    dead: bool = false,
+    reader: ?std.Thread = null,
+
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, process: *WorkerProcess) !*WorkerMultiplexer {
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+        const self = try allocator.create(WorkerMultiplexer);
+        errdefer allocator.destroy(self);
+        self.* = .{ .io = io, .allocator = allocator, .process = process };
+        self.reader = try std.Thread.spawn(.{}, readerMain, .{self});
+        return self;
+    }
+
+    /// Kills the process, drains the reader thread and frees the multiplexer.
+    /// Callers must have no requests in flight.
+    pub fn shutdown(self: *WorkerMultiplexer) void {
+        self.process.kill(self.io, self.allocator);
+        if (self.reader) |thread| thread.join();
+        var it = self.slots.valueIterator();
+        while (it.next()) |slot| {
+            if (slot.*.output) |output| self.allocator.free(output);
+            self.allocator.destroy(slot.*);
+        }
+        self.slots.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    pub fn allocateRequestId(self: *WorkerMultiplexer) i32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const id = self.next_request_id;
+        self.next_request_id +%= 1;
+        if (self.next_request_id <= 0) self.next_request_id = 1;
+        return id;
+    }
+
+    /// Sends one framed request carrying `request_id` and waits for its response.
+    pub fn request(
+        self: *WorkerMultiplexer,
+        request_bytes: []const u8,
+        request_id: i32,
+        timeout_ns: ?u64,
+        cancellation: ?*const std.atomic.Value(bool),
+    ) !Response {
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedHost;
+        const io = self.io;
+        const control = ExecutionControl{
+            .started = if (timeout_ns != null) std.Io.Clock.awake.now(io) else null,
+            .timeout_ns = timeout_ns,
+            .cancellation = cancellation,
+        };
+
+        const slot = try self.allocator.create(Slot);
+        slot.* = .{};
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.dead) {
+                self.allocator.destroy(slot);
+                return error.WorkerDied;
+            }
+            try self.slots.put(self.allocator, request_id, slot);
+        }
+        defer {
+            self.mutex.lockUncancelable(io);
+            _ = self.slots.remove(request_id);
+            self.mutex.unlock(io);
+            if (slot.output) |output| self.allocator.free(output);
+            self.allocator.destroy(slot);
+        }
+
+        {
+            self.write_mutex.lockUncancelable(io);
+            defer self.write_mutex.unlock(io);
+            try self.process.writeRequest(io, request_bytes, control);
+        }
+
+        while (true) {
+            {
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                if (slot.failed) return error.WorkerDied;
+                if (slot.done) {
+                    const output = slot.output orelse try self.allocator.alloc(u8, 0);
+                    slot.output = null;
+                    return .{ .exit_code = slot.exit_code, .output = output };
+                }
+            }
+            try control.check(io);
+            try io.sleep(.fromMilliseconds(wait_poll_ms), .awake);
+        }
+    }
+
+    fn readerMain(self: *WorkerMultiplexer) void {
+        self.readLoop() catch {};
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.dead = true;
+        var it = self.slots.valueIterator();
+        while (it.next()) |slot| {
+            if (!slot.*.done) slot.*.failed = true;
+        }
+    }
+
+    fn readLoop(self: *WorkerMultiplexer) !void {
+        const linux = std.os.linux;
+        var decoder = persistent_worker.ResponseDecoder.init(.proto);
+        defer decoder.deinit(self.allocator);
+        var poll_fds = [_]linux.pollfd{
+            .{ .fd = self.process.stdout_fd, .events = linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR, .revents = 0 },
+        };
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const poll_rc = linux.poll(&poll_fds, poll_fds.len, -1);
+            switch (linux.errno(poll_rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
+            if (poll_fds[0].revents & linux.POLL.NVAL != 0) return error.WorkerDied;
+            const rc = linux.read(self.process.stdout_fd, buffer[0..].ptr, buffer.len);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return error.Unexpected,
+            }
+            const n: usize = @intCast(rc);
+            if (n == 0) return error.WorkerDied;
+            var response = try decoder.feed(self.allocator, buffer[0..n]);
+            while (response) |value| {
+                try self.deliver(value);
+                response = try decoder.next(self.allocator);
+            }
+        }
+    }
+
+    fn deliver(self: *WorkerMultiplexer, response: persistent_worker.WorkResponse) !void {
+        const output = try self.allocator.dupe(u8, response.output);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const slot = self.slots.get(response.request_id) orelse {
+            // The requester gave up (timeout or cancellation) before the answer came.
+            self.allocator.free(output);
+            return;
+        };
+        if (slot.output) |previous| self.allocator.free(previous);
+        slot.output = output;
+        slot.exit_code = response.exit_code;
+        slot.done = true;
     }
 };
 

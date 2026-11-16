@@ -12,6 +12,15 @@ const reapi = @import("reapi.zig");
 pub const key_property = "persistentWorkerKey";
 pub const protocol_property = "persistentWorkerProtocol";
 pub const enable_property = "actiond.persistent_workers";
+pub const multiplex_property = "actiond.worker_multiplex";
+/// Tools known to honor `WorkRequest.sandbox_dir` (resolve every input and
+/// output path under it), which is what lets one JVM serve concurrent
+/// requests with distinct input trees. Bazel sends no multiplex information to
+/// remote executors, so this is decided here by the worker's startup argv.
+pub const multiplex_sandboxing_tools = [_][]const u8{
+    "rules_kotlin+/src/main/kotlin/build",
+    "JavaBuilder",
+};
 pub const cmdline_prefix = "actiond.persistent_workers=";
 pub const persistent_worker_flag = "--persistent_worker";
 pub const max_key_len = 128;
@@ -95,6 +104,10 @@ pub const Plan = struct {
     startup_args: [][]const u8,
     /// Flagfile arguments in command order, still in their `@`/`--flagfile=` form.
     flagfile_args: [][]const u8,
+    /// One worker serves several requests at once, each in its own
+    /// `sandbox_dir`; only for proto workers on the sandboxing allowlist or
+    /// with `actiond.worker_multiplex=1`.
+    multiplex: bool,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.pool_key);
@@ -140,11 +153,25 @@ pub const Plan = struct {
             .key = key,
             .protocol = protocol,
             .pool_key = pool_key,
+            .multiplex = protocol == .proto and multiplexSupported(startup.items, platformProperty(platform, multiplex_property)),
             .startup_args = try startup.toOwnedSlice(allocator),
             .flagfile_args = try flagfiles.toOwnedSlice(allocator),
         };
     }
 };
+
+/// `actiond.worker_multiplex` decides when present; otherwise any startup
+/// argument naming a tool from `multiplex_sandboxing_tools` opts in.
+pub fn multiplexSupported(startup_args: []const []const u8, property: ?[]const u8) bool {
+    if (propertyDisables(property)) return false;
+    if (propertyEnables(property)) return true;
+    for (startup_args) |arg| {
+        for (multiplex_sandboxing_tools) |tool| {
+            if (std.mem.indexOf(u8, arg, tool) != null) return true;
+        }
+    }
+    return false;
+}
 
 /// Reads a flagfile by its execroot-relative path. Implemented by the executor
 /// over the mounted workspace, and by tests over an in-memory map.
@@ -160,11 +187,25 @@ pub fn expandRequestArguments(
     allocator: std.mem.Allocator,
     flagfile_args: []const []const u8,
     reader: FlagfileReader,
+    /// Bazel's behavior: `--flagfile=` stays literal for the worker to read.
+    /// Sandboxed multiplex requests pass `false` so the worker never has to
+    /// resolve that path against `sandbox_dir` itself.
+    literal_flagfiles: bool,
 ) ![][]u8 {
     var out: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer freeArguments(allocator, out.items);
     errdefer out.deinit(allocator);
-    for (flagfile_args) |arg| try expandArgument(allocator, arg, reader, &out, 0);
+    for (flagfile_args) |arg| {
+        if (!literal_flagfiles) {
+            if (flagfilePath(arg)) |path| {
+                var at_buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+                const as_at = try std.fmt.bufPrint(&at_buffer, "@{s}", .{path});
+                try expandArgument(allocator, as_at, reader, &out, 0);
+                continue;
+            }
+        }
+        try expandArgument(allocator, arg, reader, &out, 0);
+    }
     return try out.toOwnedSlice(allocator);
 }
 
@@ -222,14 +263,16 @@ pub const WorkResponse = struct {
     }
 };
 
-/// Encodes a singleplex `blaze.worker.WorkRequest` with only `arguments` set
-/// (and `request_id` when non-zero), framed for the given protocol: a varint
-/// length prefix for proto, one JSON object followed by a newline for json.
+/// Encodes a `blaze.worker.WorkRequest` with `arguments`, `request_id` (0 for
+/// singleplex) and `sandbox_dir` (empty for singleplex), framed for the given
+/// protocol: a varint length prefix for proto, one JSON object followed by a
+/// newline for json.
 pub fn encodeWorkRequest(
     allocator: std.mem.Allocator,
     protocol: Protocol,
     arguments: []const []const u8,
     request_id: i32,
+    sandbox_dir: []const u8,
 ) ![]u8 {
     switch (protocol) {
         .proto => {
@@ -237,6 +280,7 @@ pub fn encodeWorkRequest(
             defer body.deinit();
             for (arguments) |argument| try body.writeStringField(1, argument);
             if (request_id != 0) try body.writeInt32Field(3, request_id);
+            if (sandbox_dir.len != 0) try body.writeStringField(6, sandbox_dir);
             const payload = body.writtenBytes();
 
             var framed = protobuf.Writer.init(allocator);
@@ -254,10 +298,12 @@ pub fn encodeWorkRequest(
             const Request = struct {
                 arguments: []const []const u8,
                 requestId: i32,
+                sandboxDir: []const u8,
             };
             const encoded = try std.json.Stringify.valueAlloc(allocator, Request{
                 .arguments = arguments,
                 .requestId = request_id,
+                .sandboxDir = sandbox_dir,
             }, .{});
             defer allocator.free(encoded);
             try out.appendSlice(allocator, encoded);
@@ -283,11 +329,18 @@ pub const ResponseDecoder = struct {
         self.* = undefined;
     }
 
-    /// Appends bytes and returns the decoded response once it is complete.
-    /// The returned `output` is owned by the decoder until `deinit`.
+    /// Appends bytes and returns the first complete response, if any. Call
+    /// `next` for further responses already buffered (multiplex workers may
+    /// answer several requests in one read). The returned `output` is owned by
+    /// the decoder until the next decode or `deinit`.
     pub fn feed(self: *ResponseDecoder, allocator: std.mem.Allocator, bytes: []const u8) !?WorkResponse {
         if (self.buffer.items.len + bytes.len > max_response_bytes + 16) return error.ResponseTooLarge;
         try self.buffer.appendSlice(allocator, bytes);
+        return try self.next(allocator);
+    }
+
+    /// Decodes and consumes the next complete response from the buffer.
+    pub fn next(self: *ResponseDecoder, allocator: std.mem.Allocator) !?WorkResponse {
         return switch (self.protocol) {
             .proto => try self.tryDecodeProto(allocator),
             .json => try self.tryDecodeJson(allocator),
@@ -317,6 +370,7 @@ pub const ResponseDecoder = struct {
         if (self.owned_output) |previous| allocator.free(previous);
         self.owned_output = output;
         response.output = output;
+        self.buffer.replaceRangeAssumeCapacity(0, index + message_len, &.{});
         return response;
     }
 
@@ -340,6 +394,7 @@ pub const ResponseDecoder = struct {
         const output = try allocator.dupe(u8, parsed.value.output);
         if (self.owned_output) |previous| allocator.free(previous);
         self.owned_output = output;
+        self.buffer.clearRetainingCapacity();
         return .{
             .exit_code = parsed.value.exitCode,
             .output = output,
@@ -358,6 +413,9 @@ pub const Config = struct {
     hard_max_workers: u32 = 0,
     idle_ttl_ns: i96 = default_idle_ttl_ns,
     sticky_ns: i96 = default_sticky_ns,
+    /// Concurrent requests per multiplex worker before a second process for
+    /// the same key is started; defaults to the vCPU count.
+    multiplex_capacity: u32 = 8,
 
     /// `max_workers = clamp(memory_mib / 2048, 1, cpu_count)` (one warm JVM per
     /// 2 GiB), `hard_max_workers = clamp(memory_mib / 1365, max, cpu_count * 1.5)`:
@@ -372,6 +430,7 @@ pub const Config = struct {
         return .{
             .max_workers = @intCast(@min(soft, std.math.maxInt(u32))),
             .hard_max_workers = @intCast(@min(hard, std.math.maxInt(u32))),
+            .multiplex_capacity = @intCast(@min(cpus, std.math.maxInt(u32))),
         };
     }
 
@@ -415,12 +474,29 @@ pub const Pool = struct {
     pub const Worker = struct {
         id: u64,
         pool_key: []u8,
-        busy: bool = true,
+        /// Concurrent requests this worker accepts: 1 for singleplex, more for
+        /// multiplex workers with per-request sandbox dirs.
+        capacity: u32,
+        in_flight: u32 = 1,
+        /// True from `acquire` (fresh) until `markReady`: other requests for the
+        /// key wait instead of piling onto a process that is still starting.
+        starting: bool = true,
+        /// Set by an unhealthy release; the record leaves the pool once the
+        /// last in-flight request drains.
+        retired: bool = false,
         /// Set once the executor spawned the process; a fresh worker from
         /// `acquire` has no process yet.
         process: ?*anyopaque = null,
         last_used: std.Io.Timestamp,
         requests: u64 = 0,
+
+        pub fn idle(self: *const Worker) bool {
+            return self.in_flight == 0;
+        }
+
+        fn acceptsRequests(self: *const Worker) bool {
+            return !self.retired and !self.starting and self.in_flight < self.capacity;
+        }
     };
 
     pub const DestroyFn = *const fn (context: *anyopaque, worker: *Worker) void;
@@ -470,6 +546,7 @@ pub const Pool = struct {
         io: std.Io,
         allocator: std.mem.Allocator,
         pool_key: []const u8,
+        capacity: u32,
         cancellation: ?*const std.atomic.Value(bool),
     ) !Acquired {
         var waited = false;
@@ -479,7 +556,7 @@ pub const Pool = struct {
             }
             const now = std.Io.Clock.awake.now(io);
             self.mutex.lockUncancelable(io);
-            const decision = try self.acquireLocked(allocator, pool_key, now);
+            const decision = try self.acquireLocked(allocator, pool_key, capacity, now);
             if (decision) |acquired| {
                 if (waited) self.stats.waits += 1;
                 self.mutex.unlock(io);
@@ -499,17 +576,24 @@ pub const Pool = struct {
         self: *Pool,
         allocator: std.mem.Allocator,
         pool_key: []const u8,
+        capacity: u32,
         now: std.Io.Timestamp,
     ) !?Acquired {
         if (!self.enabled()) return error.PersistentWorkersDisabled;
         self.reapIdleLocked(allocator, now);
 
+        var same_key_starting = false;
         for (self.workers.items) |worker| {
-            if (worker.busy or !std.mem.eql(u8, worker.pool_key, pool_key)) continue;
-            worker.busy = true;
+            if (!std.mem.eql(u8, worker.pool_key, pool_key)) continue;
+            if (worker.starting and !worker.retired) same_key_starting = true;
+            if (!worker.acceptsRequests()) continue;
+            worker.in_flight += 1;
             worker.last_used = now;
             return .{ .worker = worker, .fresh = false };
         }
+        // A process for this key is still starting: joining it beats paying a
+        // second JVM start, so wait for `markReady`.
+        if (same_key_starting and capacity > 1) return null;
 
         if (self.workers.items.len >= self.config.max_workers) {
             if (self.leastRecentlyUsedIdleLocked(now)) |victim| {
@@ -527,6 +611,7 @@ pub const Pool = struct {
         worker.* = .{
             .id = self.next_id,
             .pool_key = try allocator.dupe(u8, pool_key),
+            .capacity = @max(capacity, 1),
             .last_used = now,
         };
         errdefer allocator.free(worker.pool_key);
@@ -546,16 +631,29 @@ pub const Pool = struct {
     }
 
     pub fn releaseLocked(self: *Pool, allocator: std.mem.Allocator, worker: *Worker, healthy: bool, now: std.Io.Timestamp) void {
-        if (!healthy) {
+        if (worker.in_flight != 0) worker.in_flight -= 1;
+        if (!healthy and !worker.retired) {
+            worker.retired = true;
             self.stats.destroyed_failed += 1;
-            self.removeLocked(allocator, worker);
+        }
+        if (worker.retired) {
+            // Other requests may still be in flight on a multiplex worker whose
+            // state they hold; the record goes once the last one drains.
+            if (worker.idle()) self.removeLocked(allocator, worker);
             return;
         }
-        worker.busy = false;
+        worker.starting = false;
         worker.requests += 1;
         worker.last_used = now;
         self.stats.requests += 1;
         self.reapIdleLocked(allocator, now);
+    }
+
+    /// The fresh worker's process is up; same-key requests may now join it.
+    pub fn markReady(self: *Pool, io: std.Io, worker: *Worker) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        worker.starting = false;
     }
 
     pub fn recordFallback(self: *Pool, io: std.Io) void {
@@ -580,7 +678,7 @@ pub const Pool = struct {
     pub fn summaryLocked(self: *const Pool) Summary {
         var busy: usize = 0;
         for (self.workers.items) |worker| {
-            if (worker.busy) busy += 1;
+            if (!worker.idle()) busy += 1;
         }
         return .{
             .stats = self.stats,
@@ -629,7 +727,7 @@ pub const Pool = struct {
         var victim: ?*Worker = null;
         var victim_shared = false;
         for (self.workers.items) |worker| {
-            if (worker.busy) continue;
+            if (!worker.idle() or worker.retired) continue;
             if (worker.last_used.durationTo(now).nanoseconds < self.config.sticky_ns) continue;
             const shared = self.keyWorkerCountLocked(worker.pool_key) > 1;
             const current = victim orelse {
@@ -661,7 +759,7 @@ pub const Pool = struct {
         var index: usize = 0;
         while (index < self.workers.items.len) {
             const worker = self.workers.items[index];
-            if (!worker.busy and worker.last_used.durationTo(now).nanoseconds >= self.config.idle_ttl_ns) {
+            if (worker.idle() and !worker.starting and worker.last_used.durationTo(now).nanoseconds >= self.config.idle_ttl_ns) {
                 self.stats.evicted_idle += 1;
                 self.removeLocked(allocator, worker);
                 continue;
@@ -827,7 +925,7 @@ test "expandRequestArguments expands @files line by line and keeps --flagfile li
         "--flagfile=keep.params",
         "@empty.params",
         "@@literal",
-    }, files.reader());
+    }, files.reader(), true);
     defer {
         freeArguments(std.testing.allocator, expanded);
         std.testing.allocator.free(expanded);
@@ -836,35 +934,51 @@ test "expandRequestArguments expands @files line by line and keeps --flagfile li
     const expected = [_][]const u8{ "--output", "out.jar", "", "--nested=1", "--last", "--flagfile=keep.params", "@@literal" };
     try std.testing.expectEqual(expected.len, expanded.len);
     for (expected, expanded) |want, got| try std.testing.expectEqualStrings(want, got);
+
+    // Sandboxed requests expand --flagfile= as well.
+    var sandbox_files = TestFiles{ .entries = &.{.{ .path = "keep.params", .contents = "--k\nv\n" }} };
+    const sandboxed = try expandRequestArguments(std.testing.allocator, &.{ "--flagfile=keep.params", "@@literal" }, sandbox_files.reader(), false);
+    defer {
+        freeArguments(std.testing.allocator, sandboxed);
+        std.testing.allocator.free(sandboxed);
+    }
+    const expected_sandboxed = [_][]const u8{ "--k", "v", "@@literal" };
+    try std.testing.expectEqual(expected_sandboxed.len, sandboxed.len);
+    for (expected_sandboxed, sandboxed) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
 test "expandRequestArguments rejects missing, oversized and self-referential flagfiles" {
     var files = TestFiles{ .entries = &.{
         .{ .path = "loop.params", .contents = "@loop.params\n" },
     } };
-    try std.testing.expectError(error.FileNotFound, expandRequestArguments(std.testing.allocator, &.{"@missing.params"}, files.reader()));
-    try std.testing.expectError(error.FlagfileTooDeep, expandRequestArguments(std.testing.allocator, &.{"@loop.params"}, files.reader()));
+    try std.testing.expectError(error.FileNotFound, expandRequestArguments(std.testing.allocator, &.{"@missing.params"}, files.reader(), true));
+    try std.testing.expectError(error.FlagfileTooDeep, expandRequestArguments(std.testing.allocator, &.{"@loop.params"}, files.reader(), true));
 
     const big = try std.testing.allocator.alloc(u8, max_flagfile_bytes + 1);
     defer std.testing.allocator.free(big);
     @memset(big, 'x');
     var big_files = TestFiles{ .entries = &.{.{ .path = "big.params", .contents = big }} };
-    try std.testing.expectError(error.FlagfileTooLarge, expandRequestArguments(std.testing.allocator, &.{"@big.params"}, big_files.reader()));
+    try std.testing.expectError(error.FlagfileTooLarge, expandRequestArguments(std.testing.allocator, &.{"@big.params"}, big_files.reader(), true));
 }
 
 test "encodeWorkRequest frames proto requests with a varint length prefix" {
-    const framed = try encodeWorkRequest(std.testing.allocator, .proto, &.{ "--a", "b" }, 0);
+    const framed = try encodeWorkRequest(std.testing.allocator, .proto, &.{ "--a", "b" }, 0, "");
     defer std.testing.allocator.free(framed);
     // 0x0a len "--a" | 0x0a len "b" = 5 + 3 = 8 bytes, prefixed by varint 8.
     try std.testing.expectEqualSlices(u8, &.{ 8, 0x0a, 3, '-', '-', 'a', 0x0a, 1, 'b' }, framed);
 
-    const with_id = try encodeWorkRequest(std.testing.allocator, .proto, &.{"x"}, 7);
+    const with_id = try encodeWorkRequest(std.testing.allocator, .proto, &.{"x"}, 7, "");
     defer std.testing.allocator.free(with_id);
     try std.testing.expectEqualSlices(u8, &.{ 5, 0x0a, 1, 'x', 0x18, 7 }, with_id);
 
+    // Multiplex requests carry request_id (field 3) and sandbox_dir (field 6).
+    const sandboxed = try encodeWorkRequest(std.testing.allocator, .proto, &.{"x"}, 2, "r2");
+    defer std.testing.allocator.free(sandboxed);
+    try std.testing.expectEqualSlices(u8, &.{ 9, 0x0a, 1, 'x', 0x18, 2, 0x32, 2, 'r', '2' }, sandboxed);
+
     // A payload longer than 127 bytes needs a two-byte varint prefix.
     const long_arg = "y" ** 200;
-    const long = try encodeWorkRequest(std.testing.allocator, .proto, &.{long_arg}, 0);
+    const long = try encodeWorkRequest(std.testing.allocator, .proto, &.{long_arg}, 0, "");
     defer std.testing.allocator.free(long);
     try std.testing.expectEqual(@as(u8, (203 & 0x7f) | 0x80), long[0]);
     try std.testing.expectEqual(@as(u8, 203 >> 7), long[1]);
@@ -872,9 +986,9 @@ test "encodeWorkRequest frames proto requests with a varint length prefix" {
 }
 
 test "encodeWorkRequest frames json requests as one line" {
-    const framed = try encodeWorkRequest(std.testing.allocator, .json, &.{ "--a", "quote\"d" }, 3);
+    const framed = try encodeWorkRequest(std.testing.allocator, .json, &.{ "--a", "quote\"d" }, 3, "r3");
     defer std.testing.allocator.free(framed);
-    try std.testing.expectEqualStrings("{\"arguments\":[\"--a\",\"quote\\\"d\"],\"requestId\":3}\n", framed);
+    try std.testing.expectEqualStrings("{\"arguments\":[\"--a\",\"quote\\\"d\"],\"requestId\":3,\"sandboxDir\":\"r3\"}\n", framed);
 }
 
 test "ResponseDecoder assembles a proto WorkResponse from partial reads" {
@@ -958,23 +1072,23 @@ test "Pool grows over budget instead of evicting recently used workers, up to th
     }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
 
-    const a = (try pool.acquireLocked(std.testing.allocator, "a", testTimestamp(0))).?;
-    const b = (try pool.acquireLocked(std.testing.allocator, "b", testTimestamp(0))).?;
+    const a = (try pool.acquireLocked(std.testing.allocator, "a", 1, testTimestamp(0))).?;
+    const b = (try pool.acquireLocked(std.testing.allocator, "b", 1, testTimestamp(0))).?;
     pool.releaseLocked(std.testing.allocator, a.worker, true, testTimestamp(10));
     pool.releaseLocked(std.testing.allocator, b.worker, true, testTimestamp(10));
 
     // Both idle workers were used 1 s ago: nothing is evicted, the pool grows to 3.
-    const c = (try pool.acquireLocked(std.testing.allocator, "c", testTimestamp(11))).?;
+    const c = (try pool.acquireLocked(std.testing.allocator, "c", 1, testTimestamp(11))).?;
     try std.testing.expect(c.fresh);
     try std.testing.expectEqual(@as(usize, 3), pool.workers.items.len);
     try std.testing.expectEqual(@as(u64, 0), log.destroyed.items.len);
     try std.testing.expectEqual(@as(u64, 1), pool.stats.over_budget);
 
     // At the hard cap with only sticky idle workers, callers wait.
-    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "d", testTimestamp(12))) == null);
+    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "d", 1, testTimestamp(12))) == null);
 
     // Once a worker ages past the sticky window it becomes the LRU victim.
-    const d = (try pool.acquireLocked(std.testing.allocator, "d", testTimestamp(16))).?;
+    const d = (try pool.acquireLocked(std.testing.allocator, "d", 1, testTimestamp(16))).?;
     try std.testing.expect(d.fresh);
     try std.testing.expectEqualSlices(u64, &.{1}, log.destroyed.items);
     try std.testing.expectEqual(@as(usize, 3), pool.workers.items.len);
@@ -1000,17 +1114,17 @@ test "Pool reuses idle workers per key, spawns within budget and waits when busy
     defer pool.deinit(std.testing.allocator);
     const t0 = testTimestamp(0);
 
-    const first = (try pool.acquireLocked(std.testing.allocator, "k1", t0)).?;
+    const first = (try pool.acquireLocked(std.testing.allocator, "k1", 1, t0)).?;
     try std.testing.expect(first.fresh);
     try std.testing.expectEqual(@as(u64, 1), first.worker.id);
-    const second = (try pool.acquireLocked(std.testing.allocator, "k1", t0)).?;
+    const second = (try pool.acquireLocked(std.testing.allocator, "k1", 1, t0)).?;
     try std.testing.expect(second.fresh);
     // Budget exhausted and nothing idle: caller must wait.
-    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "k1", t0)) == null);
-    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "k2", t0)) == null);
+    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "k1", 1, t0)) == null);
+    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "k2", 1, t0)) == null);
 
     pool.releaseLocked(std.testing.allocator, first.worker, true, testTimestamp(1));
-    const reused = (try pool.acquireLocked(std.testing.allocator, "k1", testTimestamp(2))).?;
+    const reused = (try pool.acquireLocked(std.testing.allocator, "k1", 1, testTimestamp(2))).?;
     try std.testing.expect(!reused.fresh);
     try std.testing.expectEqual(first.worker, reused.worker);
     try std.testing.expectEqual(@as(u64, 1), reused.worker.requests);
@@ -1025,20 +1139,20 @@ test "Pool evicts the least recently used idle worker of another key when full" 
     var pool = Pool.init(.{ .max_workers = 2, .sticky_ns = 0 }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
 
-    const a = (try pool.acquireLocked(std.testing.allocator, "a", testTimestamp(0))).?;
-    const b = (try pool.acquireLocked(std.testing.allocator, "b", testTimestamp(0))).?;
+    const a = (try pool.acquireLocked(std.testing.allocator, "a", 1, testTimestamp(0))).?;
+    const b = (try pool.acquireLocked(std.testing.allocator, "b", 1, testTimestamp(0))).?;
     pool.releaseLocked(std.testing.allocator, a.worker, true, testTimestamp(5));
     pool.releaseLocked(std.testing.allocator, b.worker, true, testTimestamp(3));
 
     // b is older; it is evicted to make room for key c.
-    const c = (try pool.acquireLocked(std.testing.allocator, "c", testTimestamp(6))).?;
+    const c = (try pool.acquireLocked(std.testing.allocator, "c", 1, testTimestamp(6))).?;
     try std.testing.expect(c.fresh);
     try std.testing.expectEqualSlices(u64, &.{2}, log.destroyed.items);
     try std.testing.expectEqual(@as(usize, 2), pool.workers.items.len);
     try std.testing.expectEqual(@as(u64, 1), pool.stats.evicted_lru);
 
     // a is still idle and still serves key a without a spawn.
-    const a_again = (try pool.acquireLocked(std.testing.allocator, "a", testTimestamp(7))).?;
+    const a_again = (try pool.acquireLocked(std.testing.allocator, "a", 1, testTimestamp(7))).?;
     try std.testing.expect(!a_again.fresh);
 }
 
@@ -1049,22 +1163,22 @@ test "Pool eviction spares the only worker of a key while another key has spares
     defer pool.deinit(std.testing.allocator);
 
     // kotlin: worker 1 (idle, oldest). javac: workers 2 and 3 (idle, newer).
-    const kotlin = (try pool.acquireLocked(std.testing.allocator, "kotlin", testTimestamp(0))).?;
-    const javac_a = (try pool.acquireLocked(std.testing.allocator, "javac", testTimestamp(0))).?;
-    const javac_b = (try pool.acquireLocked(std.testing.allocator, "javac", testTimestamp(0))).?;
+    const kotlin = (try pool.acquireLocked(std.testing.allocator, "kotlin", 1, testTimestamp(0))).?;
+    const javac_a = (try pool.acquireLocked(std.testing.allocator, "javac", 1, testTimestamp(0))).?;
+    const javac_b = (try pool.acquireLocked(std.testing.allocator, "javac", 1, testTimestamp(0))).?;
     pool.releaseLocked(std.testing.allocator, kotlin.worker, true, testTimestamp(1));
     pool.releaseLocked(std.testing.allocator, javac_a.worker, true, testTimestamp(5));
     pool.releaseLocked(std.testing.allocator, javac_b.worker, true, testTimestamp(6));
 
     // A third key evicts the older javac spare, not the lone kotlin worker.
-    _ = (try pool.acquireLocked(std.testing.allocator, "turbine", testTimestamp(7))).?;
+    _ = (try pool.acquireLocked(std.testing.allocator, "turbine", 1, testTimestamp(7))).?;
     try std.testing.expectEqualSlices(u64, &.{2}, log.destroyed.items);
-    const kotlin_again = (try pool.acquireLocked(std.testing.allocator, "kotlin", testTimestamp(8))).?;
+    const kotlin_again = (try pool.acquireLocked(std.testing.allocator, "kotlin", 1, testTimestamp(8))).?;
     try std.testing.expect(!kotlin_again.fresh);
     pool.releaseLocked(std.testing.allocator, kotlin_again.worker, true, testTimestamp(9));
 
     // With every key down to one worker, plain LRU applies (javac b idle since 6).
-    _ = (try pool.acquireLocked(std.testing.allocator, "ktfmt", testTimestamp(10))).?;
+    _ = (try pool.acquireLocked(std.testing.allocator, "ktfmt", 1, testTimestamp(10))).?;
     try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, log.destroyed.items);
 }
 
@@ -1074,20 +1188,20 @@ test "Pool retires unhealthy workers and idle workers past their TTL" {
     var pool = Pool.init(.{ .max_workers = 4, .idle_ttl_ns = 10 * std.time.ns_per_s }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
 
-    const crashed = (try pool.acquireLocked(std.testing.allocator, "k", testTimestamp(0))).?;
+    const crashed = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(0))).?;
     pool.releaseLocked(std.testing.allocator, crashed.worker, false, testTimestamp(1));
     try std.testing.expectEqualSlices(u64, &.{1}, log.destroyed.items);
     try std.testing.expectEqual(@as(usize, 0), pool.workers.items.len);
     try std.testing.expectEqual(@as(u64, 1), pool.stats.destroyed_failed);
 
-    const idle = (try pool.acquireLocked(std.testing.allocator, "k", testTimestamp(2))).?;
+    const idle = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(2))).?;
     pool.releaseLocked(std.testing.allocator, idle.worker, true, testTimestamp(3));
     // Still within TTL: reused.
-    const soon = (try pool.acquireLocked(std.testing.allocator, "k", testTimestamp(12))).?;
+    const soon = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(12))).?;
     try std.testing.expect(!soon.fresh);
     pool.releaseLocked(std.testing.allocator, soon.worker, true, testTimestamp(12));
     // Past TTL: reaped, a fresh worker is handed out.
-    const late = (try pool.acquireLocked(std.testing.allocator, "k", testTimestamp(23))).?;
+    const late = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(23))).?;
     try std.testing.expect(late.fresh);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, log.destroyed.items);
     try std.testing.expectEqual(@as(u64, 1), pool.stats.evicted_idle);
@@ -1099,7 +1213,7 @@ test "Pool reports disabled configurations instead of handing out workers" {
     var pool = Pool.init(.{ .max_workers = 0 }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
     try std.testing.expect(!pool.enabled());
-    try std.testing.expectError(error.PersistentWorkersDisabled, pool.acquireLocked(std.testing.allocator, "k", testTimestamp(0)));
+    try std.testing.expectError(error.PersistentWorkersDisabled, pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(0)));
 }
 
 test "Pool.acquire honors cancellation while every worker is busy" {
@@ -1107,9 +1221,108 @@ test "Pool.acquire honors cancellation while every worker is busy" {
     defer log.destroyed.deinit(std.testing.allocator);
     var pool = Pool.init(.{ .max_workers = 1 }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
-    _ = try pool.acquire(std.testing.io, std.testing.allocator, "k", null);
+    _ = try pool.acquire(std.testing.io, std.testing.allocator, "k", 1, null);
     var cancelled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.ExecutionCancelled, pool.acquire(std.testing.io, std.testing.allocator, "k", &cancelled));
+    try std.testing.expectError(error.ExecutionCancelled, pool.acquire(std.testing.io, std.testing.allocator, "k", 1, &cancelled));
+}
+
+test "Pool multiplex workers take several requests, hold joiners while starting, retire after draining" {
+    var log: TestDestroyLog = .{};
+    defer log.destroyed.deinit(std.testing.allocator);
+    var pool = Pool.init(.{ .max_workers = 4 }, &log, TestDestroyLog.destroy);
+    defer pool.deinit(std.testing.allocator);
+    const t0 = testTimestamp(0);
+
+    const first = (try pool.acquireLocked(std.testing.allocator, "kt", 3, t0)).?;
+    try std.testing.expect(first.fresh);
+    try std.testing.expectEqual(@as(u32, 3), first.worker.capacity);
+    // The process is still starting: a second request waits rather than spawning a second JVM.
+    try std.testing.expect((try pool.acquireLocked(std.testing.allocator, "kt", 3, t0)) == null);
+    try std.testing.expectEqual(@as(usize, 1), pool.workers.items.len);
+    first.worker.starting = false;
+
+    const second = (try pool.acquireLocked(std.testing.allocator, "kt", 3, t0)).?;
+    const third = (try pool.acquireLocked(std.testing.allocator, "kt", 3, t0)).?;
+    try std.testing.expect(!second.fresh and !third.fresh);
+    try std.testing.expectEqual(first.worker, second.worker);
+    try std.testing.expectEqual(@as(u32, 3), first.worker.in_flight);
+    // Capacity reached: a fourth request spawns a second worker for the key.
+    const fourth = (try pool.acquireLocked(std.testing.allocator, "kt", 3, t0)).?;
+    try std.testing.expect(fourth.fresh);
+    try std.testing.expectEqual(@as(usize, 2), pool.workers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), pool.summaryLocked().busy);
+
+    // One request reports the worker dead while two are still in flight: the
+    // record stays (their state is still referenced) but accepts nothing new.
+    pool.releaseLocked(std.testing.allocator, first.worker, false, testTimestamp(1));
+    try std.testing.expect(first.worker.retired);
+    try std.testing.expectEqual(@as(usize, 2), pool.workers.items.len);
+    fourth.worker.starting = false;
+    const fifth = (try pool.acquireLocked(std.testing.allocator, "kt", 3, testTimestamp(1))).?;
+    try std.testing.expectEqual(fourth.worker, fifth.worker);
+    pool.releaseLocked(std.testing.allocator, first.worker, true, testTimestamp(2));
+    try std.testing.expectEqual(@as(usize, 2), pool.workers.items.len);
+    pool.releaseLocked(std.testing.allocator, first.worker, false, testTimestamp(3));
+    try std.testing.expectEqualSlices(u64, &.{1}, log.destroyed.items);
+    try std.testing.expectEqual(@as(usize, 1), pool.workers.items.len);
+    try std.testing.expectEqual(@as(u64, 1), pool.stats.destroyed_failed);
+}
+
+test "Pool singleplex workers are reusable after their first release without markReady" {
+    var log: TestDestroyLog = .{};
+    defer log.destroyed.deinit(std.testing.allocator);
+    var pool = Pool.init(.{ .max_workers = 2 }, &log, TestDestroyLog.destroy);
+    defer pool.deinit(std.testing.allocator);
+    const w = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(0))).?;
+    // A singleplex key never waits on a starting worker; it spawns a second one.
+    const w2 = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(0))).?;
+    try std.testing.expect(w2.fresh);
+    pool.releaseLocked(std.testing.allocator, w.worker, true, testTimestamp(1));
+    try std.testing.expect(!w.worker.starting);
+    const again = (try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(2))).?;
+    try std.testing.expect(!again.fresh);
+    try std.testing.expectEqual(w.worker, again.worker);
+}
+
+test "ResponseDecoder consumes framed proto responses one at a time" {
+    var decoder = ResponseDecoder.init(.proto);
+    defer decoder.deinit(std.testing.allocator);
+    // Two responses in one read: {exit_code=0, request_id=1} then {exit_code=2, request_id=2, output="x"}.
+    const a = [_]u8{ 0x18, 1 };
+    const b = [_]u8{ 0x08, 2, 0x12, 1, 'x', 0x18, 2 };
+    const stream = [_]u8{a.len} ++ a ++ [_]u8{b.len} ++ b ++ [_]u8{b.len};
+    const first = (try decoder.feed(std.testing.allocator, &stream)).?;
+    try std.testing.expectEqual(@as(i32, 1), first.request_id);
+    try std.testing.expectEqual(@as(i32, 0), first.exit_code);
+    const second = (try decoder.next(std.testing.allocator)).?;
+    try std.testing.expectEqual(@as(i32, 2), second.request_id);
+    try std.testing.expectEqualStrings("x", second.output);
+    // Only the dangling length prefix of a third message is left.
+    try std.testing.expect((try decoder.next(std.testing.allocator)) == null);
+    try std.testing.expectEqual(@as(usize, 1), decoder.buffer.items.len);
+}
+
+test "multiplexSupported follows the property, then the tool allowlist" {
+    const kotlin: []const []const u8 = &.{ "bazel-out/exec/bin/external/rules_kotlin+/src/main/kotlin/build", "--persistent_worker" };
+    const javac: []const []const u8 = &.{ "external/jdk/bin/java", "-jar", "external/java_tools/JavaBuilder_deploy.jar", "--persistent_worker" };
+    const detekt: []const []const u8 = &.{ "bazel-out/exec/bin/external/rules_detekt+/detekt/wrapper/bin", "--persistent_worker" };
+    try std.testing.expect(multiplexSupported(kotlin, null));
+    try std.testing.expect(multiplexSupported(javac, null));
+    try std.testing.expect(!multiplexSupported(detekt, null));
+    try std.testing.expect(multiplexSupported(detekt, "1"));
+    try std.testing.expect(!multiplexSupported(kotlin, "0"));
+
+    var plan = (try Plan.fromCommand(std.testing.allocator, testCommand(&.{ kotlin[0], "--flagfile=a.params" }, null), .{ .properties = &.{
+        .{ .name = key_property, .value = test_key },
+    } })).?;
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expect(plan.multiplex);
+    var json_plan = (try Plan.fromCommand(std.testing.allocator, testCommand(&.{ kotlin[0], "--flagfile=a.params" }, null), .{ .properties = &.{
+        .{ .name = key_property, .value = test_key },
+        .{ .name = protocol_property, .value = "json" },
+    } })).?;
+    defer json_plan.deinit(std.testing.allocator);
+    try std.testing.expect(!json_plan.multiplex);
 }
 
 test "Pool stats render as actiondfs-stats lines" {
@@ -1117,7 +1330,7 @@ test "Pool stats render as actiondfs-stats lines" {
     defer log.destroyed.deinit(std.testing.allocator);
     var pool = Pool.init(.{ .max_workers = 3 }, &log, TestDestroyLog.destroy);
     defer pool.deinit(std.testing.allocator);
-    _ = try pool.acquireLocked(std.testing.allocator, "k", testTimestamp(0));
+    _ = try pool.acquireLocked(std.testing.allocator, "k", 1, testTimestamp(0));
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     try pool.appendStats(std.testing.io, std.testing.allocator, &out);

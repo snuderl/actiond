@@ -638,7 +638,19 @@ pub const WorkerState = struct {
     borrowed_source_count: usize = 0,
     root_shared: bool = false,
     process: ?action_runner.WorkerProcess = null,
-    requests: u64 = 0,
+    multiplex: bool = false,
+    multiplexer: ?*action_runner.WorkerMultiplexer = null,
+    /// Multiplex workers: the first request's tree, kept mounted at `tree_path`
+    /// for the worker's lifetime so the tool files behind the `/workspace`
+    /// symlinks never go away.
+    tool_workspace: ?ActiondfsWorkspace = null,
+    requests: std.atomic.Value(u64) = .init(0),
+    next_request_id: std.atomic.Value(i32) = .init(1),
+
+    fn nextRequestId(self: *WorkerState) i32 {
+        const id = self.next_request_id.fetchAdd(1, .monotonic);
+        return if (id <= 0) 1 else id;
+    }
 
     fn truncateStderr(self: *WorkerState) void {
         if (comptime builtin.os.tag != .linux) return;
@@ -658,7 +670,9 @@ pub const WorkerState = struct {
     }
 
     fn deinit(self: *WorkerState, io: std.Io, allocator: std.mem.Allocator) void {
+        if (self.multiplexer) |multiplexer| multiplexer.shutdown();
         if (self.process) |*process| process.terminate(io, allocator);
+        if (self.tool_workspace) |*tool_workspace| tool_workspace.deinit(io, allocator);
         if (comptime builtin.os.tag == .linux) {
             unmountCollectionTarget(self.tree_path);
             if (self.root_shared) unmountCollectionTarget(self.root_path_z);
@@ -689,7 +703,7 @@ pub fn destroyPoolWorker(context: *anyopaque, worker: *persistent_worker.Pool.Wo
     const host: *WorkerPoolHost = @ptrCast(@alignCast(context));
     const opaque_state = worker.process orelse return;
     const state: *WorkerState = @ptrCast(@alignCast(opaque_state));
-    logWorkerEvent(host.io, "persistent worker retired worker={d} requests={d}", .{ state.id, state.requests });
+    logWorkerEvent(host.io, "persistent worker retired worker={d} requests={d}", .{ state.id, state.requests.load(.monotonic) });
     state.deinit(host.io, host.allocator);
     worker.process = null;
 }
@@ -700,6 +714,7 @@ fn createWorkerState(
     worker_root_path: []const u8,
     id: u64,
     protocol: persistent_worker.Protocol,
+    multiplex: bool,
     platform: ?reapi.Platform,
     options: ExecuteOptions,
 ) !*WorkerState {
@@ -729,6 +744,7 @@ fn createWorkerState(
     state.* = .{
         .id = id,
         .protocol = protocol,
+        .multiplex = multiplex,
         .root_path = root_path,
         .root_path_z = root_path_z,
         .root_dir = root_dir,
@@ -785,6 +801,18 @@ fn workerExitStatus(exit_code: i32) action_runner.Status {
     return .{ .exited = 1 };
 }
 
+fn logWorkerRequestFailure(io: std.Io, key: []const u8, state: *WorkerState, action_digest: cas.Digest, err: anyerror) void {
+    var tail_buffer: [worker_stderr_log_bytes]u8 = undefined;
+    var action_hash: [64]u8 = undefined;
+    logWorkerEvent(io, "persistent worker request failed key={s} worker={d} action={s} err={s} stderr_tail={s}", .{
+        key,
+        state.id,
+        action_digest.formatHex(&action_hash),
+        @errorName(err),
+        state.stderrTail(io, &tail_buffer),
+    });
+}
+
 /// Runs the action in a warm worker. Errors other than cancellation and
 /// deadline exceeded make the caller fall back to the cold path; the worker
 /// that failed has been retired by then.
@@ -808,18 +836,58 @@ fn executeWithWorker(
     const cas_blob_root_path = options.cas_blob_root_path orelse return error.MissingCasBlobRoot;
     const timeout_ns: ?u64 = if (action.timeout) |timeout| try timeout.toNanoseconds() else null;
 
+    const capacity: u32 = if (plan.multiplex) pool.config.multiplex_capacity else 1;
     const phase_start = std.Io.Clock.awake.now(io);
-    const acquired = try pool.acquire(io, allocator, plan.pool_key, options.cancellation);
+    const acquired = try pool.acquire(io, allocator, plan.pool_key, capacity, options.cancellation);
     const acquire_done = std.Io.Clock.awake.now(io);
     const worker = acquired.worker;
     var healthy = false;
     defer pool.release(io, allocator, worker, healthy);
 
     if (acquired.fresh) {
-        worker.process = try createWorkerState(io, allocator, worker_root_path, worker.id, plan.protocol, platform, options);
+        worker.process = try createWorkerState(io, allocator, worker_root_path, worker.id, plan.protocol, plan.multiplex, platform, options);
     }
     const state: *WorkerState = @ptrCast(@alignCast(worker.process.?));
-    if (state.protocol != plan.protocol) return error.WorkerProtocolMismatch;
+    if (state.protocol != plan.protocol or state.multiplex != plan.multiplex) return error.WorkerProtocolMismatch;
+
+    // Multiplex workers keep their first input tree mounted at /tree for the
+    // tool files behind the /workspace symlinks, and serve every request from
+    // its own /workspace/r<N> named by `sandbox_dir`. Singleplex workers
+    // remount /tree per request.
+    var request_id: i32 = 0;
+    var sandbox_name_buffer: [32]u8 = undefined;
+    var sandbox_name: []const u8 = "";
+    var sandbox_rel_buffer: [48]u8 = undefined;
+    var sandbox_rel: []const u8 = "";
+    var owned_tree_path: ?[:0]u8 = null;
+    defer if (owned_tree_path) |path| allocator.free(path);
+    const tree_path: [:0]const u8 = if (state.multiplex) path: {
+        request_id = state.nextRequestId();
+        sandbox_name = try std.fmt.bufPrint(&sandbox_name_buffer, "r{d}", .{request_id});
+        sandbox_rel = try std.fmt.bufPrint(&sandbox_rel_buffer, "workspace/{s}", .{sandbox_name});
+        try state.root_dir.createDirPath(io, sandbox_rel);
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ state.workspace_path, sandbox_name }, 0);
+        owned_tree_path = path;
+        break :path path;
+    } else state.tree_path;
+    defer if (state.multiplex) state.root_dir.deleteDir(io, sandbox_rel) catch {};
+
+    if (state.multiplex and state.tool_workspace == null) {
+        var tool_workspace = try ActiondfsWorkspace.init(
+            io,
+            allocator,
+            cas_blob_root_path,
+            options.actiondfs_stage_root_path,
+            state.root_path,
+            state.tree_path,
+            input_root_digest,
+            .actiondfs_strict,
+        );
+        errdefer tool_workspace.deinit(io, allocator);
+        try tool_workspace.mountWorkspace();
+        try syncWorkspaceLinks(io, allocator, store, state.root_dir, input_root_digest, options.cancellation);
+        state.tool_workspace = tool_workspace;
+    }
 
     var workspace = try ActiondfsWorkspace.init(
         io,
@@ -827,7 +895,7 @@ fn executeWithWorker(
         cas_blob_root_path,
         options.actiondfs_stage_root_path,
         state.root_path,
-        state.tree_path,
+        tree_path,
         input_root_digest,
         .actiondfs_strict,
     );
@@ -842,7 +910,7 @@ fn executeWithWorker(
     try action_runner.prepareChrootWritableDirs(io, workspace.stagePath(), default_run_options.sandbox_uid, default_run_options.sandbox_gid);
     try checkExecutionCancellation(options.cancellation);
     try workspace.mountWorkspace();
-    try syncWorkspaceLinks(io, allocator, store, state.root_dir, input_root_digest, options.cancellation);
+    if (!state.multiplex) try syncWorkspaceLinks(io, allocator, store, state.root_dir, input_root_digest, options.cancellation);
 
     const input_fetch_completed_wall = timestampNow(io);
     if (state.process == null) {
@@ -854,56 +922,64 @@ fn executeWithWorker(
             .stderr_fd = state.stderr_fd,
             .cancellation = options.cancellation,
         });
-        logWorkerEvent(io, "persistent worker spawned key={s} worker={d} pid={d} argv0={s}", .{
+        if (state.multiplex) state.multiplexer = try action_runner.WorkerMultiplexer.init(io, allocator, &state.process.?);
+        pool.markReady(io, worker);
+        logWorkerEvent(io, "persistent worker spawned key={s} worker={d} pid={d} multiplex={} argv0={s}", .{
             plan.key,
             state.id,
             state.process.?.pid,
+            state.multiplex,
             plan.startup_args[0],
         });
     }
-    state.truncateStderr();
+    if (!state.multiplex) state.truncateStderr();
 
-    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = state.tree_path };
-    const arguments = try persistent_worker.expandRequestArguments(allocator, plan.flagfile_args, flagfiles.reader());
+    var flagfiles = WorkspaceFlagfiles{ .io = io, .workspace_path = tree_path };
+    // Sandboxed requests get `--flagfile=` expanded too: the tool would otherwise
+    // resolve that path against its cwd instead of `sandbox_dir`.
+    const arguments = try persistent_worker.expandRequestArguments(allocator, plan.flagfile_args, flagfiles.reader(), !state.multiplex);
     defer {
         persistent_worker.freeArguments(allocator, arguments);
         allocator.free(arguments);
     }
-    const request_bytes = try persistent_worker.encodeWorkRequest(allocator, plan.protocol, arguments, 0);
+    const request_bytes = try persistent_worker.encodeWorkRequest(allocator, plan.protocol, arguments, request_id, sandbox_name);
     defer allocator.free(request_bytes);
-    var decoder = persistent_worker.ResponseDecoder.init(plan.protocol);
-    defer decoder.deinit(allocator);
 
     const execution_start_wall = timestampNow(io);
     const execution_start = std.Io.Clock.awake.now(io);
     const setup_elapsed_ms = @divTrunc(acquire_done.durationTo(execution_start).nanoseconds, std.time.ns_per_ms);
     const wait_elapsed_ms = @divTrunc(phase_start.durationTo(acquire_done).nanoseconds, std.time.ns_per_ms);
-    const response = state.process.?.request(io, allocator, request_bytes, &decoder, timeout_ns, options.cancellation) catch |err| {
-        var tail_buffer: [worker_stderr_log_bytes]u8 = undefined;
-        var action_hash: [64]u8 = undefined;
-        logWorkerEvent(io, "persistent worker request failed key={s} worker={d} action={s} err={s} stderr_tail={s}", .{
-            plan.key,
-            state.id,
-            action_digest.formatHex(&action_hash),
-            @errorName(err),
-            state.stderrTail(io, &tail_buffer),
-        });
-        return err;
-    };
+    var exit_code: i32 = 0;
+    var stderr_bytes: []u8 = undefined;
+    if (state.multiplexer) |multiplexer| {
+        const response = multiplexer.request(request_bytes, request_id, timeout_ns, options.cancellation) catch |err| {
+            logWorkerRequestFailure(io, plan.key, state, action_digest, err);
+            return err;
+        };
+        exit_code = response.exit_code;
+        stderr_bytes = response.output;
+    } else {
+        var decoder = persistent_worker.ResponseDecoder.init(plan.protocol);
+        defer decoder.deinit(allocator);
+        const response = state.process.?.request(io, allocator, request_bytes, &decoder, timeout_ns, options.cancellation) catch |err| {
+            logWorkerRequestFailure(io, plan.key, state, action_digest, err);
+            return err;
+        };
+        exit_code = response.exit_code;
+        stderr_bytes = try allocator.dupe(u8, response.output);
+    }
+    errdefer allocator.free(stderr_bytes);
     const execution_completed_wall = timestampNow(io);
     const execution_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms);
     workspace.unmountWorkspace();
     // The process answered, so it stays in the pool; a non-zero exit code is a
     // normal failed action, not a broken worker.
     healthy = true;
-    state.requests += 1;
-
-    const stderr_bytes = try allocator.dupe(u8, response.output);
-    errdefer allocator.free(stderr_bytes);
+    const request_count = state.requests.fetchAdd(1, .monotonic) + 1;
     const stdout_bytes = try allocator.alloc(u8, 0);
     errdefer allocator.free(stdout_bytes);
     var outcome: action_runner.Outcome = .{
-        .status = workerExitStatus(response.exit_code),
+        .status = workerExitStatus(exit_code),
         .stdout = stdout_bytes,
         .stderr = stderr_bytes,
         .stderr_digest = if (stderr_bytes.len != 0) try store.putBytes(io, stderr_bytes) else null,
@@ -941,9 +1017,9 @@ fn executeWithWorker(
     logWorkerEvent(io, "persistent worker request key={s} worker={d} request={d} action={s} exit={d} exec_ms={d} wait_ms={d} setup_ms={d} collect_ms={d} fresh={}", .{
         plan.key,
         state.id,
-        state.requests,
+        request_count,
         action_digest.formatHex(&action_hash),
-        response.exit_code,
+        exit_code,
         execution_elapsed_ms,
         wait_elapsed_ms,
         setup_elapsed_ms,
