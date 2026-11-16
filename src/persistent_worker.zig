@@ -13,6 +13,8 @@ pub const key_property = "persistentWorkerKey";
 pub const protocol_property = "persistentWorkerProtocol";
 pub const enable_property = "actiond.persistent_workers";
 pub const multiplex_property = "actiond.worker_multiplex";
+/// Overrides the pool's per-worker concurrency for this action's key.
+pub const multiplex_capacity_property = "actiond.worker_multiplex_capacity";
 /// Tools known to honor `WorkRequest.sandbox_dir` (resolve every input and
 /// output path under it), which is what lets one JVM serve concurrent
 /// requests with distinct input trees. Bazel sends no multiplex information to
@@ -29,6 +31,7 @@ pub const max_flagfile_depth = 8;
 pub const max_response_bytes = 16 * 1024 * 1024;
 pub const default_idle_ttl_ns: i96 = 30 * std.time.ns_per_min;
 pub const default_sticky_ns: i96 = 5 * std.time.ns_per_s;
+pub const default_multiplex_sticky_ns: i96 = 60 * std.time.ns_per_s;
 pub const default_memory_per_worker_mib: u64 = 2048;
 pub const burst_memory_per_worker_mib: u64 = 1365;
 
@@ -108,6 +111,8 @@ pub const Plan = struct {
     /// `sandbox_dir`; only for proto workers on the sandboxing allowlist or
     /// with `actiond.worker_multiplex=1`.
     multiplex: bool,
+    /// From `actiond.worker_multiplex_capacity`; null uses the pool default.
+    multiplex_capacity: ?u32 = null,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.pool_key);
@@ -154,6 +159,10 @@ pub const Plan = struct {
             .protocol = protocol,
             .pool_key = pool_key,
             .multiplex = protocol == .proto and multiplexSupported(startup.items, platformProperty(platform, multiplex_property)),
+            .multiplex_capacity = if (platformProperty(platform, multiplex_capacity_property)) |value|
+                std.fmt.parseInt(u32, value, 10) catch null
+            else
+                null,
             .startup_args = try startup.toOwnedSlice(allocator),
             .flagfile_args = try flagfiles.toOwnedSlice(allocator),
         };
@@ -413,6 +422,9 @@ pub const Config = struct {
     hard_max_workers: u32 = 0,
     idle_ttl_ns: i96 = default_idle_ttl_ns,
     sticky_ns: i96 = default_sticky_ns,
+    /// Multiplex workers cost a full JVM start and serve a whole key, so they
+    /// stay sticky much longer than singleplex ones.
+    multiplex_sticky_ns: i96 = default_multiplex_sticky_ns,
     /// Concurrent requests per multiplex worker before a second process for
     /// the same key is started; defaults to the vCPU count.
     multiplex_capacity: u32 = 8,
@@ -725,20 +737,24 @@ pub const Pool = struct {
     /// not evict the only warm worker of another.
     fn leastRecentlyUsedIdleLocked(self: *Pool, now: std.Io.Timestamp) ?*Worker {
         var victim: ?*Worker = null;
-        var victim_shared = false;
+        var victim_rank: u8 = 0;
         for (self.workers.items) |worker| {
             if (!worker.idle() or worker.retired) continue;
-            if (worker.last_used.durationTo(now).nanoseconds < self.config.sticky_ns) continue;
+            const sticky = if (worker.capacity > 1) self.config.multiplex_sticky_ns else self.config.sticky_ns;
+            if (worker.last_used.durationTo(now).nanoseconds < sticky) continue;
+            // Higher rank is evicted first: singleplex spares, then singleplex
+            // lone workers, then multiplex spares, then multiplex lone workers.
             const shared = self.keyWorkerCountLocked(worker.pool_key) > 1;
+            const rank: u8 = (if (worker.capacity == 1) @as(u8, 2) else 0) + (if (shared) @as(u8, 1) else 0);
             const current = victim orelse {
                 victim = worker;
-                victim_shared = shared;
+                victim_rank = rank;
                 continue;
             };
-            if (shared != victim_shared) {
-                if (shared) {
+            if (rank != victim_rank) {
+                if (rank > victim_rank) {
                     victim = worker;
-                    victim_shared = true;
+                    victim_rank = rank;
                 }
                 continue;
             }
@@ -1180,6 +1196,32 @@ test "Pool eviction spares the only worker of a key while another key has spares
     // With every key down to one worker, plain LRU applies (javac b idle since 6).
     _ = (try pool.acquireLocked(std.testing.allocator, "ktfmt", 1, testTimestamp(10))).?;
     try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, log.destroyed.items);
+}
+
+test "Pool evicts idle singleplex workers before multiplex ones and keeps multiplex workers sticky longer" {
+    var log: TestDestroyLog = .{};
+    defer log.destroyed.deinit(std.testing.allocator);
+    var pool = Pool.init(.{
+        .max_workers = 2,
+        .sticky_ns = 0,
+        .multiplex_sticky_ns = 60 * std.time.ns_per_s,
+    }, &log, TestDestroyLog.destroy);
+    defer pool.deinit(std.testing.allocator);
+
+    // kotlin: multiplex worker 1, idle since t=0 (oldest). jdeps: singleplex worker 2, idle since t=50.
+    const kotlin = (try pool.acquireLocked(std.testing.allocator, "kotlin", 8, testTimestamp(0))).?;
+    const jdeps = (try pool.acquireLocked(std.testing.allocator, "jdeps", 1, testTimestamp(0))).?;
+    pool.releaseLocked(std.testing.allocator, kotlin.worker, true, testTimestamp(0));
+    pool.releaseLocked(std.testing.allocator, jdeps.worker, true, testTimestamp(50));
+
+    // A third key at t=55: the multiplex worker is older but still inside its
+    // 60 s window, and singleplex workers go first anyway.
+    _ = (try pool.acquireLocked(std.testing.allocator, "javac", 8, testTimestamp(55))).?;
+    try std.testing.expectEqualSlices(u64, &.{2}, log.destroyed.items);
+
+    // With no singleplex candidate and the window over, the multiplex worker goes.
+    _ = (try pool.acquireLocked(std.testing.allocator, "turbine", 1, testTimestamp(61))).?;
+    try std.testing.expectEqualSlices(u64, &.{ 2, 1 }, log.destroyed.items);
 }
 
 test "Pool retires unhealthy workers and idle workers past their TTL" {

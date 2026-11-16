@@ -694,21 +694,35 @@ pub const WorkerState = struct {
     union_mutex: std.Io.Mutex = .init,
     inflight_trees: std.ArrayListUnmanaged(InflightTree) = .empty,
     generation: u32 = 0,
-    /// Generations still mounted at `/m/<gen>`. A generation is retired once no
-    /// in-flight request started on or before it, except `tool_generation`:
-    /// the JVM canonicalizes `java.home` through the `/merged` symlink at
-    /// startup, so the generation it started on must stay resolvable.
-    mounted_generations: std.ArrayListUnmanaged(u32) = .empty,
+    /// Generations still mounted at `/m/<gen>`, each with its own upper (two
+    /// overlay mounts must never share an upperdir: overlayfs calls that
+    /// undefined and it showed up as stale negative dentries). A new
+    /// generation layers every still-relevant older upper under the in-flight
+    /// trees, so files written earlier stay visible. A generation is retired
+    /// once no in-flight request started on or before it, except
+    /// `tool_generation`: the JVM canonicalizes `java.home` through the
+    /// `/merged` symlink at startup, so that one must stay resolvable. Upper
+    /// directories are only deleted with the worker, because retired
+    /// generations' uppers may still be lowers of live ones.
+    mounted_generations: std.ArrayListUnmanaged(MountedGeneration) = .empty,
+    uppers: std.ArrayListUnmanaged(GenerationUpper) = .empty,
     tool_generation: ?u32 = null,
     stage_base_path: ?[]u8 = null,
-    upper_path: ?[:0]u8 = null,
-    work_path: ?[:0]u8 = null,
-    upper_dir: ?std.Io.Dir = null,
 
     const InflightTree = struct {
         request_id: i32,
         tree_path: [:0]const u8,
         generation: u32,
+    };
+
+    const MountedGeneration = struct {
+        generation: u32,
+    };
+
+    const GenerationUpper = struct {
+        generation: u32,
+        upper_path: [:0]u8,
+        work_path: [:0]u8,
     };
 
     fn nextRequestId(self: *WorkerState) i32 {
@@ -735,9 +749,24 @@ pub const WorkerState = struct {
         const linux = std.os.linux;
         self.union_mutex.lockUncancelable(io);
         defer self.union_mutex.unlock(io);
-        try self.inflight_trees.append(allocator, .{ .request_id = request_id, .tree_path = tree_path, .generation = self.generation + 1 });
+        const next_generation = self.generation + 1;
+        // Uppers older than the oldest in-flight request's start generation
+        // hold nothing a live request can still need.
+        var oldest_in_use = next_generation;
+        for (self.inflight_trees.items) |tree| oldest_in_use = @min(oldest_in_use, tree.generation);
+        try self.inflight_trees.append(allocator, .{ .request_id = request_id, .tree_path = tree_path, .generation = next_generation });
         errdefer _ = self.inflight_trees.pop();
         try self.mounted_generations.ensureUnusedCapacity(allocator, 1);
+        try self.uppers.ensureUnusedCapacity(allocator, 1);
+
+        const stage_base = self.stage_base_path orelse return error.MissingStageRoot;
+        const upper_path = try std.fmt.allocPrintSentinel(allocator, "{s}/u{d}", .{ stage_base, next_generation }, 0);
+        errdefer allocator.free(upper_path);
+        const work_path = try std.fmt.allocPrintSentinel(allocator, "{s}/w{d}", .{ stage_base, next_generation }, 0);
+        errdefer allocator.free(work_path);
+        try std.Io.Dir.cwd().createDirPath(io, upper_path);
+        try std.Io.Dir.cwd().createDirPath(io, work_path);
+        try action_runner.prepareChrootWritableDirs(io, upper_path, default_run_options.sandbox_uid, default_run_options.sandbox_gid);
 
         var lowers: std.ArrayListUnmanaged(u8) = .empty;
         defer lowers.deinit(allocator);
@@ -747,20 +776,28 @@ pub const WorkerState = struct {
             if (lowers.items.len != 0) try lowers.append(allocator, ':');
             try lowers.appendSlice(allocator, self.inflight_trees.items[index].tree_path);
         }
-        const next_generation = self.generation + 1;
+        var upper_index = self.uppers.items.len;
+        while (upper_index > 0) {
+            upper_index -= 1;
+            const upper = self.uppers.items[upper_index];
+            if (upper.generation < oldest_in_use) break;
+            try lowers.append(allocator, ':');
+            try lowers.appendSlice(allocator, upper.upper_path);
+        }
         const view_path = try self.viewPath(allocator, next_generation);
         defer allocator.free(view_path);
         try std.Io.Dir.cwd().createDirPath(io, view_path);
         const data = try std.fmt.allocPrintSentinel(
             allocator,
-            "lowerdir={s},upperdir={s},workdir={s},index=off",
-            .{ lowers.items, self.upper_path.?, self.work_path.? },
+            "lowerdir={s},upperdir={s},workdir={s}",
+            .{ lowers.items, upper_path, work_path },
             0,
         );
         defer allocator.free(data);
         const rc = linux.mount("overlay", view_path.ptr, "overlay", linux.MS.NOSUID | linux.MS.NODEV, @intFromPtr(data.ptr));
         if (linux.errno(rc) != .SUCCESS) return error.MountFailed;
         errdefer unmountCollectionTarget(view_path);
+        self.uppers.appendAssumeCapacity(.{ .generation = next_generation, .upper_path = upper_path, .work_path = work_path });
 
         var target_buffer: [32]u8 = undefined;
         const target = try std.fmt.bufPrint(&target_buffer, "/m/{d}", .{next_generation});
@@ -768,7 +805,7 @@ pub const WorkerState = struct {
         try self.root_dir.symLink(io, target, "merged.next", .{});
         try std.Io.Dir.rename(self.root_dir, "merged.next", self.root_dir, "merged", io);
 
-        self.mounted_generations.appendAssumeCapacity(next_generation);
+        self.mounted_generations.appendAssumeCapacity(.{ .generation = next_generation });
         self.generation = next_generation;
         self.pruneGenerationsLocked(io, allocator);
         try syncWorkspaceLinksAdditive(io, allocator, store, self.root_dir, input_root_digest, cancellation);
@@ -791,9 +828,9 @@ pub const WorkerState = struct {
         for (self.inflight_trees.items) |tree| oldest_in_use = @min(oldest_in_use, tree.generation);
         var index: usize = 0;
         while (index < self.mounted_generations.items.len) {
-            const generation = self.mounted_generations.items[index];
+            const generation = self.mounted_generations.items[index].generation;
             const keep = generation == self.generation or generation >= oldest_in_use or
-                (self.tool_generation != null and generation == self.tool_generation.?);
+                (self.tool_generation != null and generation <= self.tool_generation.?);
             if (keep) {
                 index += 1;
                 continue;
@@ -834,8 +871,8 @@ pub const WorkerState = struct {
         if (self.multiplexer) |multiplexer| multiplexer.shutdown();
         if (self.process) |*process| process.terminate(io, allocator);
         if (comptime builtin.os.tag == .linux) {
-            for (self.mounted_generations.items) |generation| {
-                if (self.viewPath(allocator, generation)) |view| {
+            for (self.mounted_generations.items) |mounted| {
+                if (self.viewPath(allocator, mounted.generation)) |view| {
                     defer allocator.free(view);
                     unmountCollectionTarget(view);
                 } else |_| {}
@@ -844,13 +881,15 @@ pub const WorkerState = struct {
         }
         self.mounted_generations.deinit(allocator);
         self.inflight_trees.deinit(allocator);
-        if (self.upper_dir) |*dir| dir.close(io);
+        for (self.uppers.items) |upper| {
+            allocator.free(upper.upper_path);
+            allocator.free(upper.work_path);
+        }
+        self.uppers.deinit(allocator);
         if (self.stage_base_path) |path| {
             std.Io.Dir.cwd().deleteTree(io, path) catch {};
             allocator.free(path);
         }
-        if (self.upper_path) |path| allocator.free(path);
-        if (self.work_path) |path| allocator.free(path);
         if (comptime builtin.os.tag == .linux) {
             unmountCollectionTarget(self.tree_path);
             if (self.root_shared) unmountCollectionTarget(self.root_path_z);
@@ -966,18 +1005,7 @@ fn createWorkerState(
         errdefer allocator.free(stage_base);
         try std.Io.Dir.cwd().deleteTree(io, stage_base);
         try std.Io.Dir.cwd().createDirPath(io, stage_base);
-        errdefer std.Io.Dir.cwd().deleteTree(io, stage_base) catch {};
-        const upper_path = try std.fmt.allocPrintSentinel(allocator, "{s}/upper", .{stage_base}, 0);
-        errdefer allocator.free(upper_path);
-        const work_path = try std.fmt.allocPrintSentinel(allocator, "{s}/work", .{stage_base}, 0);
-        errdefer allocator.free(work_path);
-        try std.Io.Dir.cwd().createDirPath(io, upper_path);
-        try std.Io.Dir.cwd().createDirPath(io, work_path);
-        try action_runner.prepareChrootWritableDirs(io, upper_path, default_run_options.sandbox_uid, default_run_options.sandbox_gid);
-        state.upper_dir = try std.Io.Dir.openDirAbsolute(io, upper_path, .{ .iterate = true });
         state.stage_base_path = stage_base;
-        state.upper_path = upper_path;
-        state.work_path = work_path;
     }
     return state;
 }
@@ -1062,11 +1090,7 @@ fn spawnWorkerProcess(
         .stderr_fd = state.stderr_fd,
         .cancellation = options.cancellation,
     });
-    if (state.multiplex) {
-        state.multiplexer = try action_runner.WorkerMultiplexer.init(io, allocator, &state.process.?);
-        // No other request can be in flight before `markReady`, so no lock.
-        state.tool_generation = state.generation;
-    }
+    if (state.multiplex) state.multiplexer = try action_runner.WorkerMultiplexer.init(io, allocator, &state.process.?);
     pool.markReady(io, worker);
     logWorkerEvent(io, "persistent worker spawned key={s} worker={d} pid={d} multiplex={} argv0={s}", .{
         plan.key,
@@ -1162,9 +1186,29 @@ fn executeSharedExecrootRequest(
     const stderr_bytes = response.output;
     errdefer allocator.free(stderr_bytes);
     const exit_code = response.exit_code;
+    if (exit_code != 0) {
+        var action_hash: [64]u8 = undefined;
+        logWorkerEvent(io, "persistent worker nonzero exit key={s} worker={d} request={d} action={s} exit={d} output_head={s}", .{
+            plan.key,
+            state.id,
+            request_id,
+            action_digest.formatHex(&action_hash),
+            exit_code,
+            stderr_bytes[0..@min(stderr_bytes.len, 400)],
+        });
+    }
     const execution_completed_wall = timestampNow(io);
     const execution_elapsed_ms = @divTrunc(execution_start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, std.time.ns_per_ms);
     const request_count = state.requests.fetchAdd(1, .monotonic) + 1;
+    if (request_count == 1) {
+        // The JVM canonicalized java.home (and whatever else it resolved at
+        // startup) through /merged at some point before this first response,
+        // while joiners may already have published newer generations. Pin
+        // everything up to the current one for the worker's lifetime.
+        state.union_mutex.lockUncancelable(io);
+        state.tool_generation = state.generation;
+        state.union_mutex.unlock(io);
+    }
 
     const stdout_bytes = try allocator.alloc(u8, 0);
     errdefer allocator.free(stdout_bytes);
@@ -1181,25 +1225,25 @@ fn executeSharedExecrootRequest(
     if (options.staged_cas_index) |index| {
         if (outcome.stderr_digest) |digest| try index.add(io, allocator, digest);
     }
-    // Outputs are read from the upper directly (reads only; the overlay keeps
-    // serving) and copied into the CAS, since the upper is on a different
-    // filesystem from the stage promote path's rename target.
-    try collectOutputFilesWithCancellation(
-        io,
-        allocator,
-        store,
-        options.staged_cas_index,
-        state.upper_dir.?,
-        command,
-        null,
-        options.cancellation,
-        &outcome,
-    );
+    // Outputs are read through the current view, which layers every upper the
+    // request may have written to, and copied into the CAS (the overlay is a
+    // different filesystem from the promote path's rename target).
     {
         const view_path = try state.currentViewPath(io, allocator);
         defer allocator.free(view_path);
         var view_dir = try std.Io.Dir.openDirAbsolute(io, view_path, .{ .iterate = true });
         defer view_dir.close(io);
+        try collectOutputFilesWithCancellation(
+            io,
+            allocator,
+            store,
+            options.staged_cas_index,
+            view_dir,
+            command,
+            null,
+            options.cancellation,
+            &outcome,
+        );
         deleteDeclaredOutputs(io, view_dir, command);
     }
     const output_upload_completed_wall = timestampNow(io);
@@ -1268,7 +1312,7 @@ fn executeWithWorker(
     const cas_blob_root_path = options.cas_blob_root_path orelse return error.MissingCasBlobRoot;
     const timeout_ns: ?u64 = if (action.timeout) |timeout| try timeout.toNanoseconds() else null;
 
-    const capacity: u32 = if (plan.multiplex) pool.config.multiplex_capacity else 1;
+    const capacity: u32 = if (plan.multiplex) (plan.multiplex_capacity orelse pool.config.multiplex_capacity) else 1;
     const phase_start = std.Io.Clock.awake.now(io);
     const acquired = try pool.acquire(io, allocator, plan.pool_key, capacity, options.cancellation);
     const acquire_done = std.Io.Clock.awake.now(io);
